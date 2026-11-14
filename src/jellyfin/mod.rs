@@ -197,6 +197,74 @@ impl JellyfinClient {
         self.get_json(&q).await
     }
 
+    /// Filtered library query (IsResumable / IsFavorite / BoxSet lists for widgets).
+    pub async fn items_filtered(
+        &self,
+        include_types: &str,
+        filters: &str,
+        sort_by: &str,
+        sort_order: &str,
+        limit: u32,
+        fields: &str,
+    ) -> Result<ItemsEnvelope> {
+        let mut q = format!(
+            "/Users/{}/Items?Recursive=true&IncludeItemTypes={}&Limit={}&Fields={}&EnableTotalRecordCount=false&IsMissing=false",
+            self.user_id,
+            urlencoding(include_types),
+            limit,
+            urlencoding(fields),
+        );
+        if !filters.is_empty() {
+            q.push_str(&format!("&Filters={}", urlencoding(filters)));
+        }
+        if !sort_by.is_empty() {
+            q.push_str(&format!(
+                "&SortBy={}&SortOrder={}",
+                urlencoding(sort_by),
+                urlencoding(if sort_order.is_empty() {
+                    "Descending"
+                } else {
+                    sort_order
+                })
+            ));
+        }
+        self.get_json(&q).await
+    }
+
+    pub async fn resume_typed(
+        &self,
+        include_types: &str,
+        limit: u32,
+        fields: &str,
+    ) -> Result<ItemsEnvelope> {
+        let q = format!(
+            "/UserItems/Resume?UserId={}&Limit={}&Fields={}&MediaTypes=Video&IncludeItemTypes={}&EnableTotalRecordCount=false",
+            self.user_id,
+            limit,
+            urlencoding(fields),
+            urlencoding(include_types),
+        );
+        self.get_json(&q).await
+    }
+
+    pub async fn search(
+        &self,
+        term: &str,
+        include_types: &str,
+        limit: u32,
+        fields: &str,
+    ) -> Result<ItemsEnvelope> {
+        let q = format!(
+            "/Users/{}/Items?Recursive=true&SearchTerm={}&IncludeItemTypes={}&Limit={}&Fields={}&EnableTotalRecordCount=false",
+            self.user_id,
+            urlencoding(term),
+            urlencoding(include_types),
+            limit,
+            urlencoding(fields),
+        );
+        self.get_json(&q).await
+    }
+
     pub async fn playback_info(&self, item_id: &str) -> Result<PlaybackInfoResponse> {
         // JF 12: prefer POST body; query params are obsolete.
         let body = serde_json::json!({

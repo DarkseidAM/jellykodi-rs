@@ -1,6 +1,6 @@
 [package]
 name = "jellykodi-rs"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 rust-version = "1.100"
 description = "Rust sidecar for hybrid Jellyfin ↔ Kodi native library + fast widgets"

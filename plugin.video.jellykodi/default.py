@@ -109,11 +109,53 @@ def resolve_play(item_id: str) -> None:
     xbmcplugin.setResolvedUrl(HANDLE, True, li)
 
 
+def run_search(query: str = "") -> None:
+    term = (query or "").strip()
+    if not term:
+        kb = xbmc.Keyboard("", "JellyKodi Search")
+        kb.doModal()
+        if not kb.isConfirmed():
+            xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+            return
+        term = (kb.getText() or "").strip()
+    if not term:
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+    try:
+        items = ipc_call(f"SEARCH {term}", timeout=30.0)
+    except OSError as exc:
+        xbmcgui.Dialog().notification(
+            "JellyKodi", f"Search failed: {exc}", xbmcgui.NOTIFICATION_ERROR, 4000
+        )
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+    if isinstance(items, dict) and items.get("error"):
+        xbmcgui.Dialog().notification("JellyKodi", items["error"], xbmcgui.NOTIFICATION_ERROR, 4000)
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+    dir_items = []
+    for it in items or []:
+        li = xbmcgui.ListItem(label=it.get("title", ""), path=it.get("plugin_url", ""), offscreen=True)
+        li.setArt(it.get("art") or {})
+        tag = li.getVideoInfoTag()
+        tag.setMediaType(it.get("media_type") or "video")
+        tag.setTitle(it.get("title") or "")
+        tag.setPlot(it.get("plot") or "")
+        tag.setYear(int(it.get("year") or 0))
+        if it.get("is_playable"):
+            li.setProperty("IsPlayable", "true")
+        dir_items.append((it.get("plugin_url"), li, bool(it.get("is_folder"))))
+    xbmcplugin.addDirectoryItems(HANDLE, dir_items, len(dir_items))
+    xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
+
+
 def main() -> None:
     params = dict(parse_qsl(sys.argv[2].lstrip("?"))) if len(sys.argv) > 2 else {}
     mode = params.get("mode", "widget")
     if mode == "play":
         resolve_play(params.get("id", ""))
+    elif mode == "search":
+        run_search(params.get("q", ""))
     elif mode == "status":
         try:
             st = ipc_call("STATUS", timeout=2.0)
