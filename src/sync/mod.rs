@@ -167,10 +167,7 @@ fn filter_primary_versions(items: Vec<JellyfinItem>) -> Vec<JellyfinItem> {
         .into_iter()
         .filter(|it| {
             // Keep primary/main; drop linked alternates that declare a different primary.
-            match &it.primary_version_id {
-                Some(pid) if pid != &it.id => false,
-                _ => true,
-            }
+            !matches!(&it.primary_version_id, Some(pid) if pid != &it.id)
         })
         .collect()
 }
@@ -183,7 +180,26 @@ async fn delta_sync(
 ) -> Result<()> {
     match client.kodisync_items(last_update).await {
         Ok(resp) => {
-            info!("kodisync delta items={}", resp.items.len());
+            let mut added = 0u32;
+            let mut removed = 0u32;
+            let mut updated = 0u32;
+            for it in &resp.items {
+                match it.change_type.as_deref() {
+                    Some("Removed") => removed += 1,
+                    Some("Added") => added += 1,
+                    _ => updated += 1,
+                }
+                tracing::debug!(
+                    item_id = ?it.item_id,
+                    item_type = ?it.item_type,
+                    change = ?it.change_type,
+                    "kodisync item"
+                );
+            }
+            info!(
+                "kodisync delta items={} added={added} updated={updated} removed={removed}",
+                resp.items.len()
+            );
             // For now refresh widgets always; per-item MyVideos patch lands in later hardening.
             if !resp.items.is_empty() {
                 let _ = widgets::refresh_all_widgets(client, state).await;

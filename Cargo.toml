@@ -31,6 +31,12 @@ uuid = { version = "1.29.2", features = ["v4"] }
 [dev-dependencies]
 tempfile = "3.27.0"
 
+[lints.rust]
+dead_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+
 [profile.release]
 opt-level = 3
 lto = "fat"

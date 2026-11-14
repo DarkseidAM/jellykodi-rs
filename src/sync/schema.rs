@@ -102,13 +102,9 @@ CREATE TABLE IF NOT EXISTS studio_link (
 
 pub struct FkCache {
     actors: FxHashMap<String, i64>,
-    genres: FxHashMap<String, i64>,
-    studios: FxHashMap<String, i64>,
     shows: FxHashMap<String, i64>, // jellyfin series id -> idShow
     seasons: FxHashMap<String, i64>,
     next_actor: i64,
-    next_genre: i64,
-    next_studio: i64,
     next_file: i64,
     next_movie: i64,
     next_show: i64,
@@ -137,13 +133,9 @@ impl FkCache {
         )?;
         Ok(Self {
             actors: FxHashMap::default(),
-            genres: FxHashMap::default(),
-            studios: FxHashMap::default(),
             shows: FxHashMap::default(),
             seasons: FxHashMap::default(),
             next_actor: 1,
-            next_genre: 1,
-            next_studio: 1,
             next_file: 1,
             next_movie: 1,
             next_show: 1,

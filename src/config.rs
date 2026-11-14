@@ -65,16 +65,29 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let raw = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, raw)?;
-        Ok(())
-    }
-
     pub fn base_url(&self) -> &str {
         &self.server_url
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_strips_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg = Config {
+            user_id: "user".into(),
+            access_token: "token".into(),
+            server_url: "https://example.test/".into(),
+            ..Config::default()
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.user_id, "user");
+        assert_eq!(loaded.access_token, "token");
+        assert_eq!(loaded.server_url, "https://example.test");
     }
 }

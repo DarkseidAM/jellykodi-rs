@@ -74,16 +74,8 @@ impl JellyfinClient {
         &self.token
     }
 
-    pub fn user_id(&self) -> &str {
-        &self.user_id
-    }
-
     pub fn base_url(&self) -> &str {
         &self.base
-    }
-
-    pub fn device_id(&self) -> &str {
-        &self.device_id
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path_and_query: &str) -> Result<T> {
@@ -140,8 +132,13 @@ impl JellyfinClient {
     }
 
     pub async fn ping(&self) -> Result<()> {
-        let _: serde_json::Value = self.get_json("/System/Info/Public").await?;
-        Ok(())
+        match self.get_json::<serde_json::Value>("/System/Info/Public").await {
+            Ok(_) => Ok(()),
+            Err(JellyError::Http(e)) if e.is_connect() || e.is_timeout() => {
+                Err(JellyError::Offline)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Paginated library items (Movie/Series/Season/Episode/BoxSet).
@@ -197,16 +194,6 @@ impl JellyfinClient {
             urlencoding(fields),
         );
         // Latest returns a bare array in JF 12.
-        self.get_json(&q).await
-    }
-
-    pub async fn item(&self, id: &str, fields: &str) -> Result<JellyfinItem> {
-        let q = format!(
-            "/Users/{}/Items/{}?Fields={}",
-            self.user_id,
-            id,
-            urlencoding(fields)
-        );
         self.get_json(&q).await
     }
 

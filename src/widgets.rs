@@ -65,14 +65,14 @@ pub async fn refresh_continue_watching(client: &JellyfinClient) -> Result<Vec<Ko
     let mut seen_series = FxHashSet::default();
     let mut merged = Vec::with_capacity(25);
 
-    for raw in resume.items.into_iter().chain(nextup.items.into_iter()) {
+    for raw in resume.items.into_iter().chain(nextup.items) {
         if !seen_ids.insert(raw.id.clone()) {
             continue;
         }
-        if let Some(sid) = &raw.series_id {
-            if !seen_series.insert(sid.clone()) {
-                continue;
-            }
+        if let Some(sid) = &raw.series_id
+            && !seen_series.insert(sid.clone())
+        {
+            continue;
         }
         merged.push(to_widget(client, &raw));
     }
