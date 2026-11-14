@@ -73,6 +73,10 @@ async fn dispatch(
         let items = widgets::search_items(client, term.trim()).await?;
         return Ok(serde_json::to_value(items)?);
     }
+    if let Some(id) = line.strip_prefix("BROWSE ") {
+        let items = widgets::browse_items(client, id.trim()).await?;
+        return Ok(serde_json::to_value(items)?);
+    }
     if let Some(id) = line.strip_prefix("PLAY ") {
         let play = playback::resolve_play(client, id.trim()).await?;
         return Ok(serde_json::to_value(play)?);

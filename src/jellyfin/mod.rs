@@ -268,6 +268,25 @@ impl JellyfinClient {
         self.get_json(&q).await
     }
 
+    /// Children of a BoxSet / Series / Season (widget folder browse).
+    pub async fn items_by_parent(
+        &self,
+        parent_id: &str,
+        include_types: &str,
+        limit: u32,
+        fields: &str,
+    ) -> Result<ItemsEnvelope> {
+        let q = format!(
+            "/Users/{}/Items?ParentId={}&Recursive=true&IncludeItemTypes={}&Limit={}&Fields={}&EnableTotalRecordCount=false&SortBy=SortName&SortOrder=Ascending&IsMissing=false",
+            self.user_id,
+            urlencoding(parent_id),
+            urlencoding(include_types),
+            limit,
+            urlencoding(fields),
+        );
+        self.get_json(&q).await
+    }
+
     pub async fn playback_info(&self, item_id: &str) -> Result<PlaybackInfoResponse> {
         // JF 12: prefer POST body; query params are obsolete.
         let body = serde_json::json!({

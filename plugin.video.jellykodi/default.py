@@ -45,6 +45,42 @@ def ipc_call(command: str, timeout: float = 25.0):
     return json.loads(raw.decode("utf-8"))
 
 
+def render_items(items) -> None:
+    if isinstance(items, dict) and items.get("error"):
+        xbmcgui.Dialog().notification("JellyKodi", items["error"], xbmcgui.NOTIFICATION_ERROR, 4000)
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+
+    xbmcplugin.setContent(HANDLE, "videos")
+    dir_items = []
+    for it in items or []:
+        url = it.get("plugin_url") or ""
+        is_folder = bool(it.get("is_folder"))
+        is_playable = bool(it.get("is_playable")) and not is_folder
+        li = xbmcgui.ListItem(label=it.get("title", ""), path=url, offscreen=True)
+        li.setArt(it.get("art") or {})
+        tag = li.getVideoInfoTag()
+        media = it.get("media_type") or "video"
+        if media == "set":
+            media = "set"
+        tag.setMediaType(media)
+        tag.setTitle(it.get("title") or "")
+        tag.setPlot(it.get("plot") or "")
+        tag.setYear(int(it.get("year") or 0))
+        tag.setDuration(int(it.get("duration") or 0))
+        resume = int(it.get("resume_pos") or 0)
+        duration = int(it.get("duration") or 0)
+        if resume > 0 and duration > 0:
+            tag.setResumePoint(float(resume), float(duration))
+        if is_playable:
+            li.setProperty("IsPlayable", "true")
+            li.setProperty("IsFolder", "false")
+        dir_items.append((url, li, is_folder))
+
+    xbmcplugin.addDirectoryItems(HANDLE, dir_items, len(dir_items))
+    xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
+
+
 def render_widget(widget_type: str) -> None:
     try:
         items = ipc_call(f"WIDGET {widget_type}")
@@ -57,32 +93,22 @@ def render_widget(widget_type: str) -> None:
         )
         xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
         return
+    render_items(items)
 
-    if isinstance(items, dict) and items.get("error"):
-        xbmcgui.Dialog().notification("JellyKodi", items["error"], xbmcgui.NOTIFICATION_ERROR, 4000)
+
+def render_browse(item_id: str) -> None:
+    try:
+        items = ipc_call(f"BROWSE {item_id}", timeout=30.0)
+    except OSError as exc:
+        xbmcgui.Dialog().notification(
+            "JellyKodi",
+            f"Browse failed: {exc}",
+            xbmcgui.NOTIFICATION_ERROR,
+            4000,
+        )
         xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
         return
-
-    dir_items = []
-    for it in items or []:
-        li = xbmcgui.ListItem(label=it.get("title", ""), path=it.get("plugin_url", ""), offscreen=True)
-        li.setArt(it.get("art") or {})
-        tag = li.getVideoInfoTag()
-        tag.setMediaType(it.get("media_type") or "video")
-        tag.setTitle(it.get("title") or "")
-        tag.setPlot(it.get("plot") or "")
-        tag.setYear(int(it.get("year") or 0))
-        tag.setDuration(int(it.get("duration") or 0))
-        resume = int(it.get("resume_pos") or 0)
-        duration = int(it.get("duration") or 0)
-        if resume > 0 and duration > 0:
-            tag.setResumePoint(float(resume), float(duration))
-        if it.get("is_playable"):
-            li.setProperty("IsPlayable", "true")
-        dir_items.append((it.get("plugin_url"), li, bool(it.get("is_folder"))))
-
-    xbmcplugin.addDirectoryItems(HANDLE, dir_items, len(dir_items))
-    xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
+    render_items(items)
 
 
 def resolve_play(item_id: str) -> None:
@@ -129,24 +155,7 @@ def run_search(query: str = "") -> None:
         )
         xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
         return
-    if isinstance(items, dict) and items.get("error"):
-        xbmcgui.Dialog().notification("JellyKodi", items["error"], xbmcgui.NOTIFICATION_ERROR, 4000)
-        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
-        return
-    dir_items = []
-    for it in items or []:
-        li = xbmcgui.ListItem(label=it.get("title", ""), path=it.get("plugin_url", ""), offscreen=True)
-        li.setArt(it.get("art") or {})
-        tag = li.getVideoInfoTag()
-        tag.setMediaType(it.get("media_type") or "video")
-        tag.setTitle(it.get("title") or "")
-        tag.setPlot(it.get("plot") or "")
-        tag.setYear(int(it.get("year") or 0))
-        if it.get("is_playable"):
-            li.setProperty("IsPlayable", "true")
-        dir_items.append((it.get("plugin_url"), li, bool(it.get("is_folder"))))
-    xbmcplugin.addDirectoryItems(HANDLE, dir_items, len(dir_items))
-    xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
+    render_items(items)
 
 
 def main() -> None:
@@ -154,6 +163,8 @@ def main() -> None:
     mode = params.get("mode", "widget")
     if mode == "play":
         resolve_play(params.get("id", ""))
+    elif mode == "browse":
+        render_browse(params.get("id", ""))
     elif mode == "search":
         run_search(params.get("q", ""))
     elif mode == "status":

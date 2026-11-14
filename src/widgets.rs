@@ -167,9 +167,13 @@ async fn refresh_latest(
     let items = client.latest(include, 20, WIDGET_FIELDS).await?;
     Ok(items
         .into_iter()
+        .filter(|it| it.item_type == include)
         .map(|it| {
             let mut w = to_widget(client, &it);
             w.media_type = media_type.into();
+            w.is_folder = false;
+            w.is_playable = true;
+            w.plugin_url = format!("plugin://plugin.video.jellykodi/?mode=play&id={}", it.id);
             w
         })
         .collect())
@@ -207,6 +211,39 @@ pub async fn search_items(
     Ok(env.items.into_iter().map(|it| to_widget(client, &it)).collect())
 }
 
+/// Expand a BoxSet / Series / Season into playable (or nested folder) children.
+pub async fn browse_items(client: &JellyfinClient, parent_id: &str) -> Result<Vec<KodiWidgetItem>> {
+    // Prefer movies (boxsets); fall back to seasons then episodes for series.
+    let movies = client
+        .items_by_parent(parent_id, "Movie", 200, WIDGET_FIELDS)
+        .await?;
+    if !movies.items.is_empty() {
+        return Ok(movies
+            .items
+            .into_iter()
+            .map(|it| to_widget(client, &it))
+            .collect());
+    }
+    let seasons = client
+        .items_by_parent(parent_id, "Season", 100, WIDGET_FIELDS)
+        .await?;
+    if !seasons.items.is_empty() {
+        return Ok(seasons
+            .items
+            .into_iter()
+            .map(|it| to_widget(client, &it))
+            .collect());
+    }
+    let episodes = client
+        .items_by_parent(parent_id, "Episode", 200, WIDGET_FIELDS)
+        .await?;
+    Ok(episodes
+        .items
+        .into_iter()
+        .map(|it| to_widget(client, &it))
+        .collect())
+}
+
 fn to_widget(client: &JellyfinClient, raw: &JellyfinItem) -> KodiWidgetItem {
     let title = match (&raw.series_name, raw.parent_index, raw.index_number) {
         (Some(s), Some(se), Some(ep)) => format!("{} - S{:02}E{:02} - {}", s, se, ep, raw.name),
@@ -237,18 +274,15 @@ fn to_widget(client: &JellyfinClient, raw: &JellyfinItem) -> KodiWidgetItem {
         media_type: match raw.item_type.as_str() {
             "Episode" => "episode".into(),
             "Series" => "tvshow".into(),
+            "Season" => "season".into(),
             "BoxSet" => "set".into(),
             _ => "movie".into(),
         },
+        // Folders must stay inside the plugin — videodb:// sets/titles are empty (no idSet links yet).
         plugin_url: if is_playable {
             format!("plugin://plugin.video.jellykodi/?mode=play&id={}", raw.id)
-        } else if raw.item_type == "Series" {
-            // Folder stub — open native TV library (series browse not yet in JK).
-            "videodb://tvshows/titles/".into()
-        } else if raw.item_type == "BoxSet" {
-            "videodb://movies/sets/".into()
         } else {
-            format!("plugin://plugin.video.jellykodi/?mode=play&id={}", raw.id)
+            format!("plugin://plugin.video.jellykodi/?mode=browse&id={}", raw.id)
         },
         is_folder,
         is_playable,
