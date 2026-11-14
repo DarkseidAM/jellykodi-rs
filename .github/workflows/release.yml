@@ -65,7 +65,7 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION="$(sed -n 's/.*version="\([^"]*\)".*/\1/p' plugin.video.jellykodi/addon.xml | head -1)-dev"
+            VERSION="$(sed -n 's/.*<addon [^>]*version="\([^"]*\)".*/\1/p' plugin.video.jellykodi/addon.xml | head -1)-dev"
           fi
           STAGE=$(mktemp -d)
           ADDON="$STAGE/plugin.video.jellykodi"
@@ -82,41 +82,14 @@ jobs:
           cp target/aarch64-unknown-linux-gnu/release/jellykodi-rs "$ADDON/bin/"
           chmod 755 "$ADDON/bin/jellykodi-rs"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            # Only bump the root <addon ... version="..."> — never <import version=...>.
-            python3 - "$ADDON/addon.xml" "$VERSION" <<'PY'
-import re, sys
-from pathlib import Path
-path, ver = Path(sys.argv[1]), sys.argv[2]
-text = path.read_text(encoding="utf-8")
-new, n = re.subn(
-    r'(<addon\b[^>]*?\bversion=")[^"]+(")',
-    rf"\g<1>{ver}\2",
-    text,
-    count=1,
-)
-if n != 1:
-    raise SystemExit(f"expected 1 root addon version bump, got {n}")
-path.write_text(new, encoding="utf-8")
-PY
+            python3 scripts/set-addon-root-version.py "$ADDON/addon.xml" "$VERSION"
           fi
           ZIP="plugin.video.jellykodi-${VERSION}.zip"
           (cd "$STAGE" && zip -r "$GITHUB_WORKSPACE/${ZIP}" plugin.video.jellykodi)
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
           echo "ZIP=${ZIP}" >> "$GITHUB_ENV"
           python3 scripts/build-kodi-repo.py --plugin-zip "$ZIP" --out repo-dist
-          # Sanity: import deps must keep their own versions
-          python3 - "$ZIP" <<'PY'
-import sys, zipfile, xml.etree.ElementTree as ET
-with zipfile.ZipFile(sys.argv[1]) as zf:
-    xml = zf.read("plugin.video.jellykodi/addon.xml")
-root = ET.fromstring(xml)
-assert root.attrib["version"]
-for imp in root.find("requires") or []:
-    if imp.attrib.get("addon") == "xbmc.python":
-        assert imp.attrib["version"] != root.attrib["version"], imp.attrib
-        assert imp.attrib["version"].startswith("3."), imp.attrib
-print("addon.xml versions ok:", root.attrib["version"])
-PY
+          python3 scripts/verify-addon-zip.py "$ZIP"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
