@@ -5,100 +5,9 @@ use rusqlite::{params, Connection};
 use rustc_hash::FxHashMap;
 use std::path::Path;
 
-/// Minimal MyVideos-compatible schema sufficient for native Movies/TV browsing via plugin paths.
-const SCHEMA: &str = r#"
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-CREATE TABLE IF NOT EXISTS path (
-  idPath INTEGER PRIMARY KEY,
-  strPath TEXT,
-  strContent TEXT,
-  strScraper TEXT
-);
-CREATE TABLE IF NOT EXISTS files (
-  idFile INTEGER PRIMARY KEY,
-  idPath INTEGER,
-  strFilename TEXT,
-  playCount INTEGER,
-  lastPlayed TEXT,
-  dateAdded TEXT
-);
-CREATE TABLE IF NOT EXISTS movie (
-  idMovie INTEGER PRIMARY KEY,
-  idFile INTEGER,
-  c00 TEXT, c01 TEXT, c07 TEXT, c11 TEXT, c12 TEXT, c14 TEXT, c18 TEXT,
-  premiered TEXT
-);
-CREATE TABLE IF NOT EXISTS tvshow (
-  idShow INTEGER PRIMARY KEY,
-  c00 TEXT, c01 TEXT, c05 TEXT, c08 TEXT, c14 TEXT
-);
-CREATE TABLE IF NOT EXISTS seasons (
-  idSeason INTEGER PRIMARY KEY,
-  idShow INTEGER,
-  season INTEGER,
-  name TEXT
-);
-CREATE TABLE IF NOT EXISTS episode (
-  idEpisode INTEGER PRIMARY KEY,
-  idFile INTEGER,
-  c00 TEXT, c01 TEXT,
-  c12 TEXT, c13 TEXT,
-  idShow INTEGER,
-  idSeason INTEGER
-);
-CREATE TABLE IF NOT EXISTS sets (
-  idSet INTEGER PRIMARY KEY,
-  strSet TEXT,
-  strOverview TEXT
-);
-CREATE TABLE IF NOT EXISTS movie_link (
-  idSet INTEGER,
-  idMovie INTEGER
-);
-CREATE TABLE IF NOT EXISTS actor (
-  actor_id INTEGER PRIMARY KEY,
-  name TEXT
-);
-CREATE TABLE IF NOT EXISTS actor_link (
-  actor_id INTEGER,
-  media_id INTEGER,
-  media_type TEXT,
-  role TEXT,
-  cast_order INTEGER
-);
-CREATE TABLE IF NOT EXISTS art (
-  media_id INTEGER,
-  media_type TEXT,
-  type TEXT,
-  url TEXT
-);
-CREATE TABLE IF NOT EXISTS bookmark (
-  idFile INTEGER,
-  timeInSeconds REAL,
-  totalTimeInSeconds REAL,
-  player TEXT,
-  type INTEGER
-);
-CREATE TABLE IF NOT EXISTS genre (
-  genre_id INTEGER PRIMARY KEY,
-  name TEXT
-);
-CREATE TABLE IF NOT EXISTS genre_link (
-  genre_id INTEGER,
-  media_id INTEGER,
-  media_type TEXT
-);
-CREATE TABLE IF NOT EXISTS studio (
-  studio_id INTEGER PRIMARY KEY,
-  name TEXT
-);
-CREATE TABLE IF NOT EXISTS studio_link (
-  studio_id INTEGER,
-  media_id INTEGER,
-  media_type TEXT
-);
-"#;
+/// Real CoreELEC / Kodi 22 `MyVideos149` schema (tables + indexes + version row).
+/// Slimmer hand-rolled schemas lack `version` and cause Kodi to error on open.
+const SCHEMA: &str = include_str!("myvideos149.sql");
 
 pub struct FkCache {
     actors: FxHashMap<String, i64>,
@@ -479,6 +388,16 @@ impl MapDb {
             return Ok(0);
         }
         let conn = Connection::open(path)?;
+        // Full sync currently stores the item count in meta — the per-id `map` table is
+        // filled by later delta work. Without reading meta, every restart re-runs full sync.
+        if let Ok(v) = conn.query_row(
+            "SELECT v FROM meta WHERE k = 'last_count'",
+            [],
+            |r| r.get::<_, String>(0),
+        ) && let Ok(n) = v.parse::<u64>()
+        {
+            return Ok(n);
+        }
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM map", [], |r| r.get(0))
             .unwrap_or(0);
@@ -497,6 +416,10 @@ impl MapDb {
         conn.execute(
             "INSERT OR REPLACE INTO meta (k,v) VALUES ('last_count', ?1)",
             params![count.to_string()],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (k,v) VALUES ('last_full_sync', ?1)",
+            params![chrono::Utc::now().to_rfc3339()],
         )?;
         Ok(())
     }

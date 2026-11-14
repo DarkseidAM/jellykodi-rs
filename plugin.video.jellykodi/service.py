@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import time
@@ -14,6 +15,7 @@ import xbmcaddon
 import xbmcvfs
 
 ADDON = xbmcaddon.Addon()
+xbmc.log("[jellykodi] service module loaded", xbmc.LOGINFO)
 
 
 def profile() -> str:
@@ -31,6 +33,10 @@ def config_path() -> str:
 def binary_path() -> str:
     base = xbmcvfs.translatePath(ADDON.getAddonInfo("path"))
     return os.path.join(base, "bin", "jellykodi-rs")
+
+
+def daemon_log_path() -> str:
+    return os.path.join(profile(), "daemon.log")
 
 
 def ensure_config() -> str:
@@ -66,6 +72,31 @@ def ensure_config() -> str:
     return path
 
 
+def stop_stale_daemon() -> None:
+    """Kill any leftover jellykodi-rs for this add-on path (manual nohup, prior crash)."""
+    bin_path = binary_path()
+    try:
+        out = subprocess.check_output(["pgrep", "-f", bin_path], text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return
+    for pid_s in out.split():
+        try:
+            pid = int(pid_s.strip())
+            if pid == os.getpid():
+                continue
+            os.kill(pid, signal.SIGTERM)
+            xbmc.log(f"[jellykodi] stopped stale daemon pid={pid}", xbmc.LOGINFO)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+    time.sleep(0.5)
+    sock = sock_path()
+    if os.path.exists(sock):
+        try:
+            os.remove(sock)
+        except OSError:
+            pass
+
+
 def notify_daemon(payload: dict) -> None:
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
@@ -87,8 +118,6 @@ class UnifiedJellyPlayer(xbmc.Player):
 
     def _capture_ids(self) -> None:
         try:
-            # Best-effort: properties set on resolved ListItem may not always surface;
-            # service still reports file path events for daemon-side correlation later.
             pass
         except Exception:
             pass
@@ -144,16 +173,21 @@ class UnifiedJellyPlayer(xbmc.Player):
 
 
 def run_service() -> None:
+    xbmc.log("[jellykodi] run_service enter", xbmc.LOGINFO)
     cfg = ensure_config()
     bin_path = binary_path()
+    stop_stale_daemon()
     proc = None
+    log_fh = None
     if os.path.isfile(bin_path) and os.access(bin_path, os.X_OK):
+        log_fh = open(daemon_log_path(), "ab", buffering=0)
         proc = subprocess.Popen(
             [bin_path, "--config", cfg],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
-        xbmc.log(f"[jellykodi] started daemon pid={proc.pid}", xbmc.LOGINFO)
+        xbmc.log(f"[jellykodi] started daemon pid={proc.pid} bin={bin_path}", xbmc.LOGINFO)
     else:
         xbmc.log(f"[jellykodi] missing binary at {bin_path}", xbmc.LOGERROR)
 
@@ -161,10 +195,21 @@ def run_service() -> None:
     monitor = xbmc.Monitor()
     try:
         while not monitor.abortRequested():
+            if proc is not None and proc.poll() is not None:
+                xbmc.log(
+                    f"[jellykodi] daemon exited code={proc.returncode}; restarting",
+                    xbmc.LOGWARNING,
+                )
+                log_fh = open(daemon_log_path(), "ab", buffering=0)
+                proc = subprocess.Popen(
+                    [bin_path, "--config", cfg],
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
             if player.isPlayingVideo():
                 try:
                     player.current_pos = player.getTime()
-                    # periodic progress
                     if int(time.time()) % 10 == 0 and player.item_id:
                         notify_daemon(
                             {
@@ -186,6 +231,12 @@ def run_service() -> None:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        if log_fh is not None:
+            try:
+                log_fh.close()
+            except Exception:
+                pass
+        xbmc.log("[jellykodi] run_service exit", xbmc.LOGINFO)
 
 
 if __name__ == "__main__":

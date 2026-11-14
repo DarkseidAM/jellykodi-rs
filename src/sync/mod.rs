@@ -217,6 +217,8 @@ async fn delta_sync(
 
 fn find_or_create_myvideos_path(db_dir: &PathBuf) -> Result<PathBuf> {
     std::fs::create_dir_all(db_dir)?;
+    // Prefer an existing MyVideos*.db that already has a `version` table so we replace
+    // the DB Kodi can open — never invent a higher-numbered broken file (MyVideos150…).
     let mut candidates: Vec<_> = std::fs::read_dir(db_dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -228,8 +230,20 @@ fn find_or_create_myvideos_path(db_dir: &PathBuf) -> Result<PathBuf> {
         })
         .collect();
     candidates.sort();
-    if let Some(p) = candidates.pop() {
-        return Ok(p);
+    for p in candidates.iter().rev() {
+        if let Ok(conn) = rusqlite::Connection::open(p) {
+            let ok: bool = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='version'",
+                    [],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if ok {
+                return Ok(p.clone());
+            }
+        }
     }
-    Ok(db_dir.join("MyVideos131.db"))
+    // Schema seed uses idVersion=149 (CoreELEC 22 / Kodi 22.0-RC2).
+    Ok(db_dir.join("MyVideos149.db"))
 }
