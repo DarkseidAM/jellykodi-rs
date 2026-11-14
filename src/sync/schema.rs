@@ -33,8 +33,27 @@ pub struct FkCache {
 
 pub fn open_fresh_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    // Staging-only: maximize eMMC write throughput. Restored in finalize_staging_db
+    // before Kodi opens the swapped DB.
+    conn.execute_batch(
+        "PRAGMA journal_mode = OFF;
+         PRAGMA synchronous = OFF;
+         PRAGMA cache_size = -65536;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA mmap_size = 268435456;",
+    )?;
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
+}
+
+/// Return staging DB to Kodi-safe journal/sync settings before swap.
+pub fn finalize_staging_db(conn: &mut Connection) -> Result<()> {
+    conn.execute_batch(
+        "PRAGMA journal_mode = DELETE;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA optimize;",
+    )?;
+    Ok(())
 }
 
 impl FkCache {
@@ -109,17 +128,19 @@ fn insert_movie(
     let filename = format!("plugin://plugin.video.jellykodi/?mode=play&id={}", item.id);
     let (play_count, last_played, pos) = userdata(item);
     let duration = item.runtime_ticks.unwrap_or(0) / 10_000_000;
-    tx.execute(
-        "INSERT INTO files (idFile, idPath, strFilename, playCount, lastPlayed, dateAdded) VALUES (?1,?2,?3,?4,?5,?6)",
-        params![
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO files (idFile, idPath, strFilename, playCount, lastPlayed, dateAdded) VALUES (?1,?2,?3,?4,?5,?6)",
+        )?;
+        stmt.execute(params![
             file_id,
             cache.movie_path_id,
             filename,
             play_count,
             last_played,
             item.premiered.as_deref().unwrap_or("")
-        ],
-    )?;
+        ])?;
+    }
     let genres = item
         .genres
         .as_ref()
@@ -132,9 +153,11 @@ fn insert_movie(
         .unwrap_or_default();
     let rating_id = insert_rating(tx, cache, movie_id, "movie", item)?;
     let uniqueid_id = insert_uniqueid(tx, cache, movie_id, "movie", item)?;
-    tx.execute(
-        "INSERT INTO movie (idMovie, idFile, c00, c01, c05, c07, c09, c11, c12, c14, c18, premiered) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO movie (idMovie, idFile, c00, c01, c05, c07, c09, c11, c12, c14, c18, premiered) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        )?;
+        stmt.execute(params![
             movie_id,
             file_id,
             item.name,
@@ -147,24 +170,25 @@ fn insert_movie(
             genres,
             studios,
             item.premiered.as_deref().unwrap_or("")
-        ],
-    )?;
-    // MyVideos150 movie_view INNER JOINs videoversion + videoversiontype.
-    tx.execute(
-        "INSERT INTO videoversion (idFile, idMedia, media_type, itemType, idType) VALUES (?1,?2,'movie',?3,?4)",
-        params![
+        ])?;
+    }
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO videoversion (idFile, idMedia, media_type, itemType, idType) VALUES (?1,?2,'movie',?3,?4)",
+        )?;
+        stmt.execute(params![
             file_id,
             movie_id,
             VIDEO_ASSET_TYPE_VERSION,
             VIDEO_VERSION_ID_DEFAULT
-        ],
-    )?;
+        ])?;
+    }
     insert_art(tx, movie_id, "movie", client, &item.id)?;
     if pos > 0 && duration > 0 {
-        tx.execute(
+        let mut stmt = tx.prepare_cached(
             "INSERT INTO bookmark (idFile, timeInSeconds, totalTimeInSeconds, player, type) VALUES (?1,?2,?3,'VideoPlayer',1)",
-            params![file_id, pos as f64, duration as f64],
         )?;
+        stmt.execute(params![file_id, pos as f64, duration as f64])?;
     }
     insert_cast(tx, cache, item, movie_id, "movie", cast_limit)?;
     Ok(())
@@ -191,9 +215,11 @@ fn insert_series(
     if let Some(&show_id) = cache.shows.get(&item.id) {
         let rating_id = insert_rating(tx, cache, show_id, "tvshow", item)?;
         let uniqueid_id = insert_uniqueid(tx, cache, show_id, "tvshow", item)?;
-        tx.execute(
-            "UPDATE tvshow SET c00=?1, c01=?2, c04=?3, c05=?4, c08=?5, c12=?6, c13=?7, c14=?8 WHERE idShow=?9",
-            params![
+        {
+            let mut stmt = tx.prepare_cached(
+                "UPDATE tvshow SET c00=?1, c01=?2, c04=?3, c05=?4, c08=?5, c12=?6, c13=?7, c14=?8 WHERE idShow=?9",
+            )?;
+            stmt.execute(params![
                 item.name,
                 item.overview.as_deref().unwrap_or(""),
                 rating_id.map(|id| id.to_string()).unwrap_or_default(),
@@ -203,17 +229,19 @@ fn insert_series(
                 item.mpaa.as_deref().unwrap_or(""),
                 studios,
                 show_id
-            ],
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO tvshowlinkpath (idShow, idPath) VALUES (?1,?2)",
-            params![show_id, cache.tv_path_id],
-        )?;
-        // Replace placeholder art with real series art.
-        tx.execute(
-            "DELETE FROM art WHERE media_id=?1 AND media_type='tvshow'",
-            params![show_id],
-        )?;
+            ])?;
+        }
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO tvshowlinkpath (idShow, idPath) VALUES (?1,?2)",
+            )?;
+            stmt.execute(params![show_id, cache.tv_path_id])?;
+        }
+        {
+            let mut stmt =
+                tx.prepare_cached("DELETE FROM art WHERE media_id=?1 AND media_type='tvshow'")?;
+            stmt.execute(params![show_id])?;
+        }
         insert_art(tx, show_id, "tvshow", client, &item.id)?;
         return Ok(());
     }
@@ -223,10 +251,11 @@ fn insert_series(
     cache.shows.insert(item.id.clone(), show_id);
     let rating_id = insert_rating(tx, cache, show_id, "tvshow", item)?;
     let uniqueid_id = insert_uniqueid(tx, cache, show_id, "tvshow", item)?;
-    // c04=rating_id, c05=premiered, c08=genre, c12=uniqueid_id, c13=mpaa, c14=studio
-    tx.execute(
-        "INSERT INTO tvshow (idShow, c00, c01, c04, c05, c08, c12, c13, c14) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-        params![
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO tvshow (idShow, c00, c01, c04, c05, c08, c12, c13, c14) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        )?;
+        stmt.execute(params![
             show_id,
             item.name,
             item.overview.as_deref().unwrap_or(""),
@@ -236,12 +265,14 @@ fn insert_series(
             uniqueid_id.map(|id| id.to_string()).unwrap_or_default(),
             item.mpaa.as_deref().unwrap_or(""),
             studios
-        ],
-    )?;
-    tx.execute(
-        "INSERT OR IGNORE INTO tvshowlinkpath (idShow, idPath) VALUES (?1,?2)",
-        params![show_id, cache.tv_path_id],
-    )?;
+        ])?;
+    }
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR IGNORE INTO tvshowlinkpath (idShow, idPath) VALUES (?1,?2)",
+        )?;
+        stmt.execute(params![show_id, cache.tv_path_id])?;
+    }
     insert_art(tx, show_id, "tvshow", client, &item.id)?;
     Ok(())
 }
@@ -262,21 +293,26 @@ fn insert_season(
             let id = cache.next_show;
             cache.next_show += 1;
             cache.shows.insert(series_id.clone(), id);
-            tx.execute(
-                "INSERT INTO tvshow (idShow, c00, c01, c05, c08, c14) VALUES (?1,?2,'','','','')",
-                params![id, item.series_name.as_deref().unwrap_or("Unknown")],
-            )?;
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT INTO tvshow (idShow, c00, c01, c05, c08, c14) VALUES (?1,?2,'','','','')",
+                )?;
+                stmt.execute(params![id, item.series_name.as_deref().unwrap_or("Unknown")])?;
+            }
             id
         }
     };
     let season_id = cache.next_season;
     cache.next_season += 1;
     cache.seasons.insert(item.id.clone(), season_id);
-    let num = item.parent_index.unwrap_or(0);
-    tx.execute(
-        "INSERT INTO seasons (idSeason, idShow, season, name) VALUES (?1,?2,?3,?4)",
-        params![season_id, show_id, num, item.name],
-    )?;
+    // Jellyfin Season: IndexNumber is the season number; ParentIndexNumber is usually None.
+    let num = item.index_number.or(item.parent_index).unwrap_or(0);
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO seasons (idSeason, idShow, season, name) VALUES (?1,?2,?3,?4)",
+        )?;
+        stmt.execute(params![season_id, show_id, num, item.name])?;
+    }
     insert_art(tx, season_id, "season", client, &item.id)?;
     Ok(())
 }
@@ -295,17 +331,19 @@ fn insert_episode(
     let filename = format!("plugin://plugin.video.jellykodi/?mode=play&id={}", item.id);
     let (play_count, last_played, pos) = userdata(item);
     let duration = item.runtime_ticks.unwrap_or(0) / 10_000_000;
-    tx.execute(
-        "INSERT INTO files (idFile, idPath, strFilename, playCount, lastPlayed, dateAdded) VALUES (?1,?2,?3,?4,?5,?6)",
-        params![
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO files (idFile, idPath, strFilename, playCount, lastPlayed, dateAdded) VALUES (?1,?2,?3,?4,?5,?6)",
+        )?;
+        stmt.execute(params![
             file_id,
             cache.tv_path_id,
             filename,
             play_count,
             last_played,
             item.premiered.as_deref().unwrap_or("")
-        ],
-    )?;
+        ])?;
+    }
     let show_id = item
         .series_id
         .as_ref()
@@ -316,9 +354,11 @@ fn insert_episode(
         .as_ref()
         .and_then(|s| cache.seasons.get(s).copied())
         .unwrap_or(0);
-    tx.execute(
-        "INSERT INTO episode (idEpisode, idFile, c00, c01, c12, c13, idShow, idSeason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO episode (idEpisode, idFile, c00, c01, c12, c13, idShow, idSeason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        )?;
+        stmt.execute(params![
             ep_id,
             file_id,
             item.name,
@@ -327,16 +367,18 @@ fn insert_episode(
             item.index_number.unwrap_or(0).to_string(),
             show_id,
             season_id
-        ],
-    )?;
+        ])?;
+    }
     insert_art(tx, ep_id, "episode", client, &item.id)?;
     if pos > 0 && duration > 0 {
-        tx.execute(
+        let mut stmt = tx.prepare_cached(
             "INSERT INTO bookmark (idFile, timeInSeconds, totalTimeInSeconds, player, type) VALUES (?1,?2,?3,'VideoPlayer',1)",
-            params![file_id, pos as f64, duration as f64],
         )?;
+        stmt.execute(params![file_id, pos as f64, duration as f64])?;
     }
-    insert_cast(tx, cache, item, ep_id, "episode", cast_limit)?;
+    if cast_limit > 0 {
+        insert_cast(tx, cache, item, ep_id, "episode", cast_limit)?;
+    }
     Ok(())
 }
 
@@ -348,14 +390,15 @@ fn insert_boxset(
 ) -> Result<()> {
     let set_id = cache.next_set;
     cache.next_set += 1;
-    tx.execute(
-        "INSERT INTO sets (idSet, strSet, strOverview) VALUES (?1,?2,?3)",
-        params![
+    {
+        let mut stmt =
+            tx.prepare_cached("INSERT INTO sets (idSet, strSet, strOverview) VALUES (?1,?2,?3)")?;
+        stmt.execute(params![
             set_id,
             item.name,
             item.overview.as_deref().unwrap_or("")
-        ],
-    )?;
+        ])?;
+    }
     insert_art(tx, set_id, "set", client, &item.id)?;
     Ok(())
 }
@@ -372,10 +415,10 @@ fn insert_rating(
     };
     let id = cache.next_rating;
     cache.next_rating += 1;
-    tx.execute(
+    let mut stmt = tx.prepare_cached(
         "INSERT INTO rating (rating_id, media_id, media_type, rating_type, rating, votes) VALUES (?1,?2,?3,'default',?4,0)",
-        params![id, media_id, media_type, rating],
     )?;
+    stmt.execute(params![id, media_id, media_type, rating])?;
     Ok(Some(id))
 }
 
@@ -389,7 +432,6 @@ fn insert_uniqueid(
     let Some(providers) = item.provider_ids.as_ref().and_then(|v| v.as_object()) else {
         return Ok(None);
     };
-    // Prefer Imdb then Tmdb then first available — matches jellyfin-kodi default uniqueid.
     let (ptype, value) = if let Some(v) = providers.get("Imdb").and_then(|x| x.as_str()) {
         ("imdb", v)
     } else if let Some(v) = providers.get("Tmdb").and_then(|x| x.as_str()) {
@@ -401,10 +443,10 @@ fn insert_uniqueid(
     };
     let id = cache.next_uniqueid;
     cache.next_uniqueid += 1;
-    tx.execute(
+    let mut stmt = tx.prepare_cached(
         "INSERT INTO uniqueid (uniqueid_id, media_id, media_type, value, type) VALUES (?1,?2,?3,?4,?5)",
-        params![id, media_id, media_type, value, ptype],
     )?;
+    stmt.execute(params![id, media_id, media_type, value, ptype])?;
     Ok(Some(id))
 }
 
@@ -415,19 +457,26 @@ fn insert_art(
     client: &JellyfinClient,
     item_id: &str,
 ) -> Result<()> {
-    // jellyfin-kodi also writes thumb(=Primary), banner, clearlogo, landscape, discart.
-    tx.execute(
-        "INSERT INTO art (media_id, media_type, type, url) VALUES (?1,?2,'poster',?3)",
-        params![media_id, media_type, client.image_url(item_id, "Primary", 720)],
-    )?;
-    tx.execute(
-        "INSERT INTO art (media_id, media_type, type, url) VALUES (?1,?2,'thumb',?3)",
-        params![media_id, media_type, client.image_url(item_id, "Primary", 720)],
-    )?;
-    tx.execute(
-        "INSERT INTO art (media_id, media_type, type, url) VALUES (?1,?2,'fanart',?3)",
-        params![media_id, media_type, client.image_url(item_id, "Backdrop", 1920)],
-    )?;
+    let poster = client.image_url(item_id, "Primary", 720);
+    let fanart = client.image_url(item_id, "Backdrop", 1920);
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO art (media_id, media_type, type, url) VALUES (?1,?2,'poster',?3)",
+        )?;
+        stmt.execute(params![media_id, media_type, &poster])?;
+    }
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO art (media_id, media_type, type, url) VALUES (?1,?2,'thumb',?3)",
+        )?;
+        stmt.execute(params![media_id, media_type, &poster])?;
+    }
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO art (media_id, media_type, type, url) VALUES (?1,?2,'fanart',?3)",
+        )?;
+        stmt.execute(params![media_id, media_type, &fanart])?;
+    }
     Ok(())
 }
 
@@ -453,23 +502,21 @@ fn insert_cast(
         } else {
             let id = cache.next_actor;
             cache.next_actor += 1;
-            tx.execute(
-                "INSERT INTO actor (actor_id, name) VALUES (?1,?2)",
-                params![id, &person.name],
-            )?;
+            let mut stmt = tx.prepare_cached("INSERT INTO actor (actor_id, name) VALUES (?1,?2)")?;
+            stmt.execute(params![id, &person.name])?;
             cache.actors.insert(person.name.clone(), id);
             id
         };
-        tx.execute(
+        let mut stmt = tx.prepare_cached(
             "INSERT INTO actor_link (actor_id, media_id, media_type, role, cast_order) VALUES (?1,?2,?3,?4,?5)",
-            params![
-                actor_id,
-                media_id,
-                media_type,
-                person.role.as_deref().unwrap_or(""),
-                idx as i64
-            ],
         )?;
+        stmt.execute(params![
+            actor_id,
+            media_id,
+            media_type,
+            person.role.as_deref().unwrap_or(""),
+            idx as i64
+        ])?;
     }
     Ok(())
 }

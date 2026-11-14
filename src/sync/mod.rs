@@ -7,26 +7,34 @@ use crate::jellyfin::JellyfinClient;
 use crate::state::AppState;
 use crate::widgets;
 use chrono::Utc;
-use schema::{bulk_insert_items, open_fresh_db, swap_into_place, FkCache, MapDb};
+use futures_util::stream::{self, StreamExt, TryStreamExt};
+use schema::{
+    bulk_insert_items, finalize_staging_db, open_fresh_db, swap_into_place, FkCache, MapDb,
+};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-const SYNC_FIELDS: &str =
-    "DateCreated,PremiereDate,CommunityRating,OfficialRating,Genres,Studios,People,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear";
+/// Full metadata for movies / series / boxsets (People joins are expensive on episodes).
+const SYNC_FIELDS_FULL: &str = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Genres,Studios,People,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear";
 
-const INCLUDE_TYPES: &str = "Movie,Series,Season,Episode,BoxSet";
+/// Lean fields for Season/Episode — no People/Studios/Genres (huge JF JOIN cost).
+const SYNC_FIELDS_LEAN: &str = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear";
+
+/// Commit SQLite every N items inside a pass (fewer fsyncs on eMMC).
+const SQLITE_COMMIT_EVERY: usize = 4500;
 
 pub async fn run_sync_workers(client: JellyfinClient, cfg: Config, state: Arc<AppState>) {
-    // Initial widget warm + optional full sync if map empty.
     if let Err(e) = widgets::refresh_all_widgets(&client, &state).await {
         warn!("initial widget refresh failed: {e}");
         *state.last_error.write().await = Some(e.to_string());
     }
 
-    let map_empty = !cfg.map_db_path.exists()
-        || MapDb::count(&cfg.map_db_path).unwrap_or(0) == 0;
+    let map_empty =
+        !cfg.map_db_path.exists() || MapDb::count(&cfg.map_db_path).unwrap_or(0) == 0;
     if map_empty {
         info!("map db empty — starting initial full sync");
         if let Err(e) = full_sync(&client, &cfg, &state).await {
@@ -50,6 +58,9 @@ pub async fn run_sync_workers(client: JellyfinClient, cfg: Config, state: Arc<Ap
                 }
             }
             _ = state.delta_notify.notified() => {
+                if state.syncing.load(Ordering::Relaxed) {
+                    continue;
+                }
                 if let Err(e) = delta_sync(&client, &cfg, &state, &last_delta).await {
                     warn!("delta sync failed: {e}");
                 } else {
@@ -58,6 +69,9 @@ pub async fn run_sync_workers(client: JellyfinClient, cfg: Config, state: Arc<Ap
                 let _ = widgets::refresh_all_widgets(&client, &state).await;
             }
             _ = tokio::time::sleep(poll) => {
+                if state.syncing.load(Ordering::Relaxed) {
+                    continue;
+                }
                 if let Err(e) = delta_sync(&client, &cfg, &state, &last_delta).await {
                     warn!("kodisync poll failed: {e}");
                 } else {
@@ -76,11 +90,7 @@ async fn wait_until_idle(state: &Arc<AppState>) {
     }
 }
 
-pub async fn full_sync(
-    client: &JellyfinClient,
-    cfg: &Config,
-    state: &Arc<AppState>,
-) -> Result<()> {
+pub async fn full_sync(client: &JellyfinClient, cfg: &Config, state: &Arc<AppState>) -> Result<()> {
     state.syncing.store(true, Ordering::SeqCst);
     let result = full_sync_inner(client, cfg, state).await;
     state.syncing.store(false, Ordering::SeqCst);
@@ -92,14 +102,14 @@ async fn full_sync_inner(
     cfg: &Config,
     state: &Arc<AppState>,
 ) -> Result<()> {
-    info!("full sync starting (JF 12 Items pagination)");
+    info!("full sync starting (ordered passes + fetch/db pipeline)");
     std::fs::create_dir_all(&cfg.staging_dir)?;
     std::fs::create_dir_all(&cfg.kodi_db_dir)?;
 
     let staging = cfg.staging_dir.join("MyVideos131_jellykodi_staging.db");
     let _ = std::fs::remove_file(&staging);
-    let mut conn = open_fresh_db(&staging)?;
-    let mut cache = FkCache::init(&conn)?;
+    let conn = open_fresh_db(&staging)?;
+    let cache = FkCache::init(&conn)?;
 
     let concurrency = if state.is_playing() {
         cfg.sync_concurrency_playing
@@ -107,68 +117,214 @@ async fn full_sync_inner(
         cfg.sync_concurrency
     };
 
-    let mut total_seen = 0u64;
-    let page = cfg.sync_page_size;
+    // Pass 1: library roots with full People/Studios/Genres.
+    let (conn, cache, n1) = sync_pass(SyncPass {
+        client,
+        cfg,
+        concurrency,
+        include_types: "Movie,Series,BoxSet",
+        fields: SYNC_FIELDS_FULL,
+        cast_limit: cfg.cast_limit,
+        pass_name: "roots",
+        conn,
+        cache,
+    })
+    .await?;
+    // Pass 2: seasons (lean fields) — cache.shows populated from pass 1.
+    let (conn, cache, n2) = sync_pass(SyncPass {
+        client,
+        cfg,
+        concurrency,
+        include_types: "Season",
+        fields: SYNC_FIELDS_LEAN,
+        cast_limit: 0,
+        pass_name: "seasons",
+        conn,
+        cache,
+    })
+    .await?;
+    // Pass 3: episodes (lean, no cast) — cache.seasons populated from pass 2.
+    let (mut conn, cache, n3) = sync_pass(SyncPass {
+        client,
+        cfg,
+        concurrency,
+        include_types: "Episode",
+        fields: SYNC_FIELDS_LEAN,
+        cast_limit: 0,
+        pass_name: "episodes",
+        conn,
+        cache,
+    })
+    .await?;
 
-    // First page to learn total.
-    let first = client
-        .items_page(INCLUDE_TYPES, 0, page, SYNC_FIELDS)
-        .await?;
-    let total = first.total_record_count.unwrap_or(first.items.len() as u64);
-    let mut batch = filter_primary_versions(first.items);
-    total_seen += batch.len() as u64;
-    bulk_insert_items(&mut conn, &mut cache, client, &batch, cfg.cast_limit)?;
-    let mut start = page;
-
-    while (start as u64) < total {
-        let mut handles = Vec::new();
-        for i in 0..concurrency {
-            let idx = start + (i as u32) * page;
-            if (idx as u64) >= total {
-                break;
-            }
-            let c = client.clone();
-            handles.push(tokio::spawn(async move {
-                c.items_page(INCLUDE_TYPES, idx, page, SYNC_FIELDS).await
-            }));
-        }
-        if handles.is_empty() {
-            break;
-        }
-        let n = handles.len() as u32;
-        for h in handles {
-            let env = h
-                .await
-                .map_err(|e| JellyError::Other(format!("join: {e}")))??;
-            batch = filter_primary_versions(env.items);
-            total_seen += batch.len() as u64;
-            bulk_insert_items(&mut conn, &mut cache, client, &batch, cfg.cast_limit)?;
-        }
-        start += n * page;
-        info!("full sync progress start={start} total≈{total} written≈{total_seen}");
-    }
-
+    let total_seen = n1 + n2 + n3;
     drop(cache);
+    finalize_staging_db(&mut conn)?;
     drop(conn);
+
     let target = find_or_create_myvideos_path(&cfg.kodi_db_dir)?;
     swap_into_place(&staging, &target)?;
     MapDb::rebuild_from_pass(&cfg.map_db_path, total_seen)?;
     *state.library_items.write().await = total_seen;
     *state.last_full_sync.write().await = Some(Utc::now().to_rfc3339());
     *state.last_error.write().await = None;
-    info!("full sync complete items≈{total_seen} -> {}", target.display());
+    info!(
+        "full sync complete items≈{total_seen} (roots={n1} seasons={n2} episodes={n3}) -> {}",
+        target.display()
+    );
     let _ = widgets::refresh_all_widgets(client, state).await;
     Ok(())
+}
+
+struct SyncPass<'a> {
+    client: &'a JellyfinClient,
+    cfg: &'a Config,
+    concurrency: usize,
+    include_types: &'a str,
+    fields: &'a str,
+    cast_limit: usize,
+    pass_name: &'a str,
+    conn: rusqlite::Connection,
+    cache: FkCache,
+}
+
+/// Fetch one IncludeItemTypes set with overlapping HTTP + single-threaded SQLite writer.
+async fn sync_pass(
+    pass: SyncPass<'_>,
+) -> Result<(rusqlite::Connection, FkCache, u64)> {
+    let SyncPass {
+        client,
+        cfg,
+        concurrency,
+        include_types,
+        fields,
+        cast_limit,
+        pass_name,
+        conn,
+        cache,
+    } = pass;
+    let page = cfg.sync_page_size;
+    let t_pass = Instant::now();
+
+    let first = client
+        .items_page(include_types, 0, page, fields)
+        .await?;
+    let total = first
+        .total_record_count
+        .unwrap_or(first.items.len() as u64);
+    info!(pass = pass_name, total, "sync pass begin");
+
+    let (tx, rx) = mpsc::channel::<Vec<JellyfinItem>>(8);
+    let client_db = client.clone();
+
+    let writer = tokio::task::spawn_blocking(move || -> Result<(rusqlite::Connection, FkCache, u64)> {
+        let mut conn = conn;
+        let mut cache = cache;
+        let mut buf: Vec<JellyfinItem> = Vec::with_capacity(SQLITE_COMMIT_EVERY);
+        let mut written = 0u64;
+        let mut rx = rx;
+
+        let mut flush = |buf: &mut Vec<JellyfinItem>,
+                         conn: &mut rusqlite::Connection,
+                         cache: &mut FkCache|
+         -> Result<()> {
+            if buf.is_empty() {
+                return Ok(());
+            }
+            let t0 = Instant::now();
+            let n = buf.len();
+            bulk_insert_items(conn, cache, &client_db, buf, cast_limit)?;
+            written += n as u64;
+            info!(
+                db_ms = t0.elapsed().as_millis() as u64,
+                n,
+                written,
+                "sqlite flush"
+            );
+            buf.clear();
+            Ok(())
+        };
+
+        while let Some(batch) = rx.blocking_recv() {
+            buf.extend(batch);
+            if buf.len() >= SQLITE_COMMIT_EVERY {
+                flush(&mut buf, &mut conn, &mut cache)?;
+            }
+        }
+        flush(&mut buf, &mut conn, &mut cache)?;
+        Ok((conn, cache, written))
+    });
+
+    // Page 0
+    let first_items = filter_primary_versions(first.items);
+    if !first_items.is_empty() {
+        tx.send(first_items)
+            .await
+            .map_err(|e| JellyError::Other(format!("sync channel: {e}")))?;
+    }
+
+    let offsets: Vec<u32> = (1u32..)
+        .map(|i| i.saturating_mul(page))
+        .take_while(|&o| (o as u64) < total)
+        .collect();
+
+    let client_f = client.clone();
+    let include = include_types.to_string();
+    let fields_s = fields.to_string();
+
+    stream::iter(offsets)
+        .map(|offset| {
+            let c = client_f.clone();
+            let inc = include.clone();
+            let f = fields_s.clone();
+            async move {
+                let t0 = Instant::now();
+                let env = c.items_page(&inc, offset, page, &f).await?;
+                let fetch_ms = t0.elapsed().as_millis() as u64;
+                let items = filter_primary_versions(env.items);
+                Ok::<_, JellyError>((offset, items, fetch_ms))
+            }
+        })
+        .buffer_unordered(concurrency.max(1))
+        .try_for_each(|(offset, items, fetch_ms)| {
+            let tx = tx.clone();
+            async move {
+                info!(
+                    pass = pass_name,
+                    offset,
+                    fetch_ms,
+                    n = items.len(),
+                    "fetched"
+                );
+                if !items.is_empty() {
+                    tx.send(items)
+                        .await
+                        .map_err(|e| JellyError::Other(format!("sync channel: {e}")))?;
+                }
+                Ok(())
+            }
+        })
+        .await?;
+
+    drop(tx);
+    let (conn, cache, written) = writer
+        .await
+        .map_err(|e| JellyError::Other(format!("writer join: {e}")))??;
+
+    info!(
+        pass = pass_name,
+        written,
+        pass_ms = t_pass.elapsed().as_millis() as u64,
+        "sync pass complete"
+    );
+    Ok((conn, cache, written))
 }
 
 /// Skip alternate versions that point at a PrimaryVersionId (one card per title).
 fn filter_primary_versions(items: Vec<JellyfinItem>) -> Vec<JellyfinItem> {
     items
         .into_iter()
-        .filter(|it| {
-            // Keep primary/main; drop linked alternates that declare a different primary.
-            !matches!(&it.primary_version_id, Some(pid) if pid != &it.id)
-        })
+        .filter(|it| !matches!(&it.primary_version_id, Some(pid) if pid != &it.id))
         .collect()
 }
 
@@ -200,15 +356,13 @@ async fn delta_sync(
                 "kodisync delta items={} added={added} updated={updated} removed={removed}",
                 resp.items.len()
             );
-            // For now refresh widgets always; per-item MyVideos patch lands in later hardening.
             if !resp.items.is_empty() {
                 let _ = widgets::refresh_all_widgets(client, state).await;
             }
-            let _ = cfg; // map path reserved for incremental writer
+            let _ = cfg;
             Ok(())
         }
         Err(e) => {
-            // Plugin route quirks shouldn't kill the loop — fall back to widget refresh.
             warn!("kodisync unavailable ({e}); widget refresh only");
             widgets::refresh_all_widgets(client, state).await
         }
@@ -217,8 +371,6 @@ async fn delta_sync(
 
 fn find_or_create_myvideos_path(db_dir: &PathBuf) -> Result<PathBuf> {
     std::fs::create_dir_all(db_dir)?;
-    // Prefer an existing MyVideos*.db that already has a `version` table so we replace
-    // the DB Kodi can open — never invent a higher-numbered broken file (MyVideos150…).
     let mut candidates: Vec<_> = std::fs::read_dir(db_dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -244,6 +396,5 @@ fn find_or_create_myvideos_path(db_dir: &PathBuf) -> Result<PathBuf> {
             }
         }
     }
-    // Schema seed uses idVersion=149 (CoreELEC 22 / Kodi 22.0-RC2).
     Ok(db_dir.join("MyVideos149.db"))
 }

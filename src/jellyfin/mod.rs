@@ -142,6 +142,7 @@ impl JellyfinClient {
     }
 
     /// Paginated library items (Movie/Series/Season/Episode/BoxSet).
+    /// Only page 0 requests `TotalRecordCount` (avoids a full-table COUNT on every page).
     pub async fn items_page(
         &self,
         include_types: &str,
@@ -149,13 +150,15 @@ impl JellyfinClient {
         limit: u32,
         fields: &str,
     ) -> Result<ItemsEnvelope> {
+        let enable_total = if start_index == 0 { "true" } else { "false" };
         let q = format!(
-            "/Users/{}/Items?Recursive=true&IncludeItemTypes={}&StartIndex={}&Limit={}&Fields={}&EnableTotalRecordCount=true&ExcludeItemTypes=Person,Studio,Genre,LiveTvChannel",
+            "/Users/{}/Items?Recursive=true&IncludeItemTypes={}&StartIndex={}&Limit={}&Fields={}&EnableTotalRecordCount={}&ExcludeItemTypes=Person,Studio,Genre,LiveTvChannel",
             self.user_id,
             urlencoding(include_types),
             start_index,
             limit,
             urlencoding(fields),
+            enable_total,
         );
         self.get_json(&q).await
     }
