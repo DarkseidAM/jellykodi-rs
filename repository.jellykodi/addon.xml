@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="repository.jellykodi" name="JellyKodi Repository" version="1.0.0" provider-name="DarkseidAM">
+  <extension point="xbmc.addon.repository">
+    <dir>
+      <info compressed="false">https://darkseidam.github.io/jellykodi-rs/addons.xml</info>
+      <checksum>https://darkseidam.github.io/jellykodi-rs/addons.xml.md5</checksum>
+      <datadir zip="true">https://darkseidam.github.io/jellykodi-rs/</datadir>
+    </dir>
+  </extension>
+  <extension point="xbmc.addon.metadata">
+    <summary lang="en_GB">Official JellyKodi Hybrid updates</summary>
+    <description lang="en_GB">Serves plugin.video.jellykodi (Rust sidecar + shim) from GitHub Pages so Kodi can auto-update.</description>
+    <platform>all</platform>
+    <license>MIT</license>
+    <source>https://github.com/DarkseidAM/jellykodi-rs</source>
+    <website>https://darkseidam.github.io/jellykodi-rs/</website>
+    <assets>
+      <icon>icon.png</icon>
+    </assets>
+  </extension>
+</addon>

@@ -12,11 +12,20 @@ Hybrid **Jellyfin 12** client for **CoreELEC** (aarch64): a Rust sidecar syncs a
 
 ## Install (CoreELEC)
 
-1. Download the latest `plugin.video.jellykodi-*.zip` from [Releases](https://github.com/DarkseidAM/jellykodi-rs/releases).
-2. In Kodi: **Add-ons → Install from zip**.
-3. Open add-on settings: set **Server URL**, **User ID**, **Access token** (reuse from JellyCon `auth.json` if migrating).
-4. Restart Kodi (service starts `bin/jellykodi-rs`).
-5. Point Arctic / skinshortcuts widget paths at:
+**Recommended (auto-updates):**
+
+1. Download [`repository.jellykodi-1.0.0.zip`](https://github.com/DarkseidAM/jellykodi-rs/releases/latest) from the latest Release (or from [GitHub Pages](https://darkseidam.github.io/jellykodi-rs/)).
+2. In Kodi: **Add-ons → Install from zip** → install the repository zip once.
+3. **Add-ons → Install from repository → JellyKodi Repository → Video add-ons → JellyKodi Hybrid**.
+4. Open add-on settings: set **Server URL**, **User ID**, **Access token** (reuse from JellyCon `auth.json` if migrating).
+5. Restart Kodi (service starts `bin/jellykodi-rs`).
+
+Kodi will pick up newer `plugin.video.jellykodi` versions from  
+`https://darkseidam.github.io/jellykodi-rs/` on the next add-on update check.
+
+**One-shot zip (no auto-update):** install `plugin.video.jellykodi-*.zip` from [Releases](https://github.com/DarkseidAM/jellykodi-rs/releases) instead of step 3.
+
+Point Arctic / skinshortcuts widget paths at:
 
 ```text
 plugin://plugin.video.jellykodi/?mode=widget&type=continue_watching
