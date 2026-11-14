@@ -72,13 +72,29 @@ def ensure_config() -> str:
     return path
 
 
+def daemon_healthy() -> bool:
+    """True if an existing daemon answers STATUS on the Unix socket."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            s.connect(sock_path())
+            s.sendall(b"STATUS\n")
+            data = s.recv(4096)
+            return bool(data) and b"online" in data
+    except OSError:
+        return False
+
+
 def stop_stale_daemon() -> None:
-    """Kill any leftover jellykodi-rs for this add-on path (manual nohup, prior crash)."""
+    """Kill leftover jellykodi-rs only if it is unhealthy (never interrupt a live sync)."""
+    if daemon_healthy():
+        xbmc.log("[jellykodi] existing daemon healthy — not restarting", xbmc.LOGINFO)
+        return
     bin_path = binary_path()
     try:
         out = subprocess.check_output(["pgrep", "-f", bin_path], text=True)
     except (subprocess.CalledProcessError, FileNotFoundError):
-        return
+        out = ""
     for pid_s in out.split():
         try:
             pid = int(pid_s.strip())
@@ -179,7 +195,10 @@ def run_service() -> None:
     stop_stale_daemon()
     proc = None
     log_fh = None
-    if os.path.isfile(bin_path) and os.access(bin_path, os.X_OK):
+    adopted = daemon_healthy()
+    if adopted:
+        xbmc.log("[jellykodi] adopting already-running daemon", xbmc.LOGINFO)
+    elif os.path.isfile(bin_path) and os.access(bin_path, os.X_OK):
         log_fh = open(daemon_log_path(), "ab", buffering=0)
         proc = subprocess.Popen(
             [bin_path, "--config", cfg],
@@ -207,6 +226,20 @@ def run_service() -> None:
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
+            elif proc is None and not daemon_healthy():
+                # Adopted daemon died, or never started — bring it back.
+                if os.path.isfile(bin_path) and os.access(bin_path, os.X_OK):
+                    log_fh = open(daemon_log_path(), "ab", buffering=0)
+                    proc = subprocess.Popen(
+                        [bin_path, "--config", cfg],
+                        stdout=log_fh,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    xbmc.log(
+                        f"[jellykodi] restarted missing daemon pid={proc.pid}",
+                        xbmc.LOGWARNING,
+                    )
             if player.isPlayingVideo():
                 try:
                     player.current_pos = player.getTime()
@@ -225,6 +258,8 @@ def run_service() -> None:
             if monitor.waitForAbort(2.0):
                 break
     finally:
+        # Only stop a daemon we spawned. Adopted/external daemons keep running
+        # across skin reloads so a mid-sync full import is not thrown away.
         if proc and proc.poll() is None:
             proc.terminate()
             try:
