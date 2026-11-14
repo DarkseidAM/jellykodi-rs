@@ -134,6 +134,69 @@ def render_items(items, content: str = "videos") -> None:
                 resume = int(it.get("resume_pos") or 0)
                 if is_playable and resume > 0 and duration > resume:
                     tag.setResumePoint(float(resume), float(duration))
+
+                streams = it.get("streams") or {}
+                if isinstance(streams, dict) and streams:
+                    video = streams.get("video")
+                    if isinstance(video, dict):
+                        v_codec = str(video.get("codec") or "")
+                        v_w = int(video.get("width") or 0)
+                        v_h = int(video.get("height") or 0)
+                        v_aspect = float(video.get("aspect") or 0.0)
+                        v_hdr = str(video.get("hdr_type") or "")
+                        try:
+                            tag.addVideoStream(
+                                xbmc.VideoStreamDetail(
+                                    width=v_w,
+                                    height=v_h,
+                                    codec=v_codec,
+                                    aspect=v_aspect,
+                                    duration=duration,
+                                )
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            li.addStreamInfo(
+                                "video",
+                                {
+                                    "codec": v_codec,
+                                    "width": v_w,
+                                    "height": v_h,
+                                    "aspect": v_aspect,
+                                    "duration": duration,
+                                },
+                            )
+                        except Exception:
+                            pass
+                        if v_hdr:
+                            li.setProperty("video.hdrtype", v_hdr)
+                    audio = streams.get("audio")
+                    if isinstance(audio, dict):
+                        a_codec = str(audio.get("codec") or "")
+                        a_ch = int(audio.get("channels") or 0)
+                        a_lang = str(audio.get("language") or "")
+                        try:
+                            tag.addAudioStream(
+                                xbmc.AudioStreamDetail(
+                                    codec=a_codec,
+                                    channels=a_ch,
+                                    language=a_lang,
+                                )
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            li.addStreamInfo(
+                                "audio",
+                                {
+                                    "codec": a_codec,
+                                    "channels": a_ch,
+                                    "language": a_lang,
+                                },
+                            )
+                        except Exception:
+                            pass
             except Exception:
                 pass
             if is_playable:

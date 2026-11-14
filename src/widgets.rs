@@ -3,12 +3,34 @@ use crate::jellyfin::types::JellyfinItem;
 use crate::jellyfin::JellyfinClient;
 use crate::state::AppState;
 use rustc_hash::FxHashSet;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::info;
 
-const WIDGET_FIELDS: &str = "PrimaryImageAspectRatio,DateCreated,Overview,PremiereDate,ProductionYear,RunTimeTicks,UserData,SeriesId,SeriesName,ParentIndexNumber,IndexNumber";
+const WIDGET_FIELDS: &str = "PrimaryImageAspectRatio,DateCreated,Overview,PremiereDate,ProductionYear,RunTimeTicks,UserData,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,MediaStreams";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KodiStreamDetails {
+    pub video: Option<KodiVideoStream>,
+    pub audio: Option<KodiAudioStream>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KodiVideoStream {
+    pub codec: String,
+    pub width: i32,
+    pub height: i32,
+    pub aspect: f64,
+    pub hdr_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KodiAudioStream {
+    pub codec: String,
+    pub channels: i32,
+    pub language: String,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct KodiWidgetItem {
@@ -23,6 +45,7 @@ pub struct KodiWidgetItem {
     pub is_playable: bool,
     pub sort_ts: String,
     pub art: KodiArt,
+    pub streams: Option<KodiStreamDetails>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -265,6 +288,7 @@ fn to_widget(client: &JellyfinClient, raw: &JellyfinItem) -> KodiWidgetItem {
     let poster_id = raw.series_id.as_deref().unwrap_or(&raw.id);
     let is_folder = matches!(raw.item_type.as_str(), "Series" | "BoxSet" | "Season" | "Folder");
     let is_playable = !is_folder && matches!(raw.item_type.as_str(), "Movie" | "Episode");
+    let streams = raw.media_streams.as_deref().and_then(extract_stream_details);
     KodiWidgetItem {
         title,
         plot: raw.overview.clone().unwrap_or_default(),
@@ -292,6 +316,46 @@ fn to_widget(client: &JellyfinClient, raw: &JellyfinItem) -> KodiWidgetItem {
             fanart: client.image_url(poster_id, "Backdrop", 1280),
             thumb: client.image_url(&raw.id, "Primary", 640),
         },
+        streams,
+    }
+}
+
+fn extract_stream_details(
+    streams: &[crate::jellyfin::types::MediaStream],
+) -> Option<KodiStreamDetails> {
+    let mut video = None;
+    let mut audio = None;
+
+    for s in streams {
+        if video.is_none() && s.stream_type == "Video" {
+            let codec = s.normalized_video_codec();
+            let width = s.width.unwrap_or(0);
+            let height = s.height.unwrap_or(0);
+            let aspect = s.parsed_aspect_ratio();
+            let hdr_type = s.hdr_type();
+            video = Some(KodiVideoStream {
+                codec,
+                width,
+                height,
+                aspect,
+                hdr_type,
+            });
+        } else if s.stream_type == "Audio" && (audio.is_none() || s.is_default) {
+            let codec = s.normalized_audio_codec();
+            let channels = s.channels.unwrap_or(2);
+            let language = s.language.clone().unwrap_or_default();
+            audio = Some(KodiAudioStream {
+                codec,
+                channels,
+                language,
+            });
+        }
+    }
+
+    if video.is_some() || audio.is_some() {
+        Some(KodiStreamDetails { video, audio })
+    } else {
+        None
     }
 }
 
@@ -344,7 +408,63 @@ mod tests {
             index_number: None,
             provider_ids: None,
             media_sources: None,
+            media_streams: None,
             primary_version_id: None,
         };
+    }
+
+    #[test]
+    fn extract_stream_details_parses_video_and_audio() {
+        let streams = vec![
+            crate::jellyfin::types::MediaStream {
+                stream_type: "Video".into(),
+                index: 0,
+                language: Some("eng".into()),
+                codec: Some("hevc".into()),
+                is_external: false,
+                is_text_subtitle: false,
+                supports_external_stream: false,
+                delivery_url: None,
+                is_default: true,
+                is_forced: false,
+                width: Some(3840),
+                height: Some(2160),
+                channels: None,
+                aspect_ratio: Some("16:9".into()),
+                profile: Some("Main 10".into()),
+                video_range_type: Some("DOVIWithEL".into()),
+                dv_profile: Some(serde_json::json!(7)),
+            },
+            crate::jellyfin::types::MediaStream {
+                stream_type: "Audio".into(),
+                index: 1,
+                language: Some("eng".into()),
+                codec: Some("truehd".into()),
+                is_external: false,
+                is_text_subtitle: false,
+                supports_external_stream: false,
+                delivery_url: None,
+                is_default: true,
+                is_forced: false,
+                width: None,
+                height: None,
+                channels: Some(8),
+                aspect_ratio: None,
+                profile: Some("Dolby TrueHD + Dolby Atmos".into()),
+                video_range_type: None,
+                dv_profile: None,
+            },
+        ];
+
+        let details = extract_stream_details(&streams).expect("stream details present");
+        let v = details.video.expect("video present");
+        assert_eq!(v.codec, "hevc");
+        assert_eq!(v.width, 3840);
+        assert_eq!(v.height, 2160);
+        assert_eq!(v.hdr_type, "dolbyvision");
+
+        let a = details.audio.expect("audio present");
+        assert_eq!(a.codec, "truehd");
+        assert_eq!(a.channels, 8);
     }
 }

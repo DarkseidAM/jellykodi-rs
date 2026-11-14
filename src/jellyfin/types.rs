@@ -54,6 +54,8 @@ pub struct JellyfinItem {
     pub provider_ids: Option<serde_json::Value>,
     #[serde(rename = "MediaSources")]
     pub media_sources: Option<Vec<MediaSource>>,
+    #[serde(rename = "MediaStreams")]
+    pub media_streams: Option<Vec<MediaStream>>,
     /// Primary version id when this item is an alternate (Merge Versions).
     #[serde(rename = "PrimaryVersionId")]
     pub primary_version_id: Option<String>,
@@ -137,6 +139,83 @@ pub struct MediaStream {
     pub width: Option<i32>,
     #[serde(rename = "Height")]
     pub height: Option<i32>,
+    #[serde(rename = "Channels")]
+    pub channels: Option<i32>,
+    #[serde(rename = "AspectRatio")]
+    pub aspect_ratio: Option<String>,
+    #[serde(rename = "Profile")]
+    pub profile: Option<String>,
+    #[serde(rename = "VideoRangeType")]
+    pub video_range_type: Option<String>,
+    #[serde(rename = "DvProfile")]
+    pub dv_profile: Option<serde_json::Value>,
+}
+
+impl MediaStream {
+    pub fn normalized_video_codec(&self) -> String {
+        let codec = self.codec.as_deref().unwrap_or("").to_ascii_lowercase();
+        let profile = self.profile.as_deref().unwrap_or("").to_ascii_lowercase();
+        if codec.contains("msmpeg4") {
+            "divx".to_string()
+        } else if codec.contains("mpeg4") && (profile.contains("simple") || profile.is_empty()) {
+            "xvid".to_string()
+        } else {
+            codec
+        }
+    }
+
+    pub fn normalized_audio_codec(&self) -> String {
+        let codec = self.codec.as_deref().unwrap_or("").to_ascii_lowercase();
+        let profile = self.profile.as_deref().unwrap_or("").to_ascii_lowercase();
+        if profile.contains("dts-hd ma") {
+            "dtshd_ma".to_string()
+        } else if profile.contains("dts-hd hra") {
+            "dtshd_hra".to_string()
+        } else if profile.contains("dts:x") {
+            "dts_x".to_string()
+        } else {
+            codec
+        }
+    }
+
+    pub fn parsed_aspect_ratio(&self) -> f64 {
+        if let Some((w, h)) = self.aspect_ratio.as_deref().and_then(|s| s.split_once(':'))
+            && let (Ok(wf), Ok(hf)) = (w.trim().parse::<f64>(), h.trim().parse::<f64>())
+            && hf > 0.0
+        {
+            return (wf / hf * 1000.0).round() / 1000.0;
+        }
+        if let (Some(w), Some(h)) = (self.width, self.height)
+            && h > 0
+        {
+            return ((w as f64) / (h as f64) * 1000.0).round() / 1000.0;
+        }
+        1.778
+    }
+
+    pub fn hdr_type(&self) -> String {
+        if self.dv_profile.is_some() {
+            return "dolbyvision".to_string();
+        }
+        if let Some(ref vrt) = self.video_range_type {
+            let u = vrt.to_ascii_uppercase();
+            if u.contains("DOVI") {
+                return "dolbyvision".to_string();
+            }
+            if u.contains("HDR10") {
+                return "hdr10".to_string();
+            }
+            if u.contains("HLG") {
+                return "hlg".to_string();
+            }
+        }
+        if let Some(p) = self.profile.as_deref()
+            && p.to_ascii_lowercase().contains("dolby vision")
+        {
+            return "dolbyvision".to_string();
+        }
+        String::new()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

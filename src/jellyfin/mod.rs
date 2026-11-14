@@ -475,4 +475,52 @@ mod tests {
         assert!(u.contains("ApiKey=abc"));
         assert!(!u.contains("api_key="));
     }
+
+    #[test]
+    fn stream_details_normalization() {
+        let v_hdr = types::MediaStream {
+            stream_type: "Video".into(),
+            index: 0,
+            language: Some("eng".into()),
+            codec: Some("hevc".into()),
+            is_external: false,
+            is_text_subtitle: false,
+            supports_external_stream: false,
+            delivery_url: None,
+            is_default: true,
+            is_forced: false,
+            width: Some(3840),
+            height: Some(2160),
+            channels: None,
+            aspect_ratio: Some("16:9".into()),
+            profile: Some("Main 10".into()),
+            video_range_type: Some("DOVIWithEL".into()),
+            dv_profile: Some(serde_json::json!(7)),
+        };
+        assert_eq!(v_hdr.normalized_video_codec(), "hevc");
+        assert_eq!(v_hdr.hdr_type(), "dolbyvision");
+        assert_eq!(v_hdr.parsed_aspect_ratio(), 1.778);
+
+        let a_atmos = types::MediaStream {
+            stream_type: "Audio".into(),
+            index: 1,
+            language: Some("eng".into()),
+            codec: Some("truehd".into()),
+            is_external: false,
+            is_text_subtitle: false,
+            supports_external_stream: false,
+            delivery_url: None,
+            is_default: true,
+            is_forced: false,
+            width: None,
+            height: None,
+            channels: Some(8),
+            aspect_ratio: None,
+            profile: Some("Dolby TrueHD + Dolby Atmos".into()),
+            video_range_type: None,
+            dv_profile: None,
+        };
+        assert_eq!(a_atmos.normalized_audio_codec(), "truehd");
+        assert_eq!(a_atmos.channels, Some(8));
+    }
 }

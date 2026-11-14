@@ -184,6 +184,9 @@ fn insert_movie(
         ])?;
     }
     insert_art(tx, movie_id, "movie", client, &item.id)?;
+    if let Some(ref streams) = item.media_streams {
+        insert_streamdetails(tx, file_id, streams, duration)?;
+    }
     if pos > 0 && duration > 0 {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO bookmark (idFile, timeInSeconds, totalTimeInSeconds, player, type) VALUES (?1,?2,?3,'VideoPlayer',1)",
@@ -354,15 +357,19 @@ fn insert_episode(
         .as_ref()
         .and_then(|s| cache.seasons.get(s).copied())
         .unwrap_or(0);
+    let duration_str = if duration > 0 { duration.to_string() } else { String::new() };
+    let premiered = item.premiered.as_deref().unwrap_or("");
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO episode (idEpisode, idFile, c00, c01, c12, c13, idShow, idSeason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO episode (idEpisode, idFile, c00, c01, c05, c09, c12, c13, idShow, idSeason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         )?;
         stmt.execute(params![
             ep_id,
             file_id,
             item.name,
             item.overview.as_deref().unwrap_or(""),
+            premiered,
+            duration_str,
             item.parent_index.unwrap_or(0).to_string(),
             item.index_number.unwrap_or(0).to_string(),
             show_id,
@@ -370,6 +377,9 @@ fn insert_episode(
         ])?;
     }
     insert_art(tx, ep_id, "episode", client, &item.id)?;
+    if let Some(ref streams) = item.media_streams {
+        insert_streamdetails(tx, file_id, streams, duration)?;
+    }
     if pos > 0 && duration > 0 {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO bookmark (idFile, timeInSeconds, totalTimeInSeconds, player, type) VALUES (?1,?2,?3,'VideoPlayer',1)",
@@ -521,6 +531,47 @@ fn insert_cast(
     Ok(())
 }
 
+fn insert_streamdetails(
+    tx: &rusqlite::Transaction<'_>,
+    file_id: i64,
+    streams: &[crate::jellyfin::types::MediaStream],
+    duration: i64,
+) -> Result<()> {
+    for s in streams {
+        match s.stream_type.as_str() {
+            "Video" => {
+                let codec = s.normalized_video_codec();
+                let aspect = s.parsed_aspect_ratio();
+                let width = s.width.unwrap_or(0);
+                let height = s.height.unwrap_or(0);
+                let hdr = s.hdr_type();
+                let mut stmt = tx.prepare_cached(
+                    "INSERT INTO streamdetails (idFile, iStreamType, strVideoCodec, fVideoAspect, iVideoWidth, iVideoHeight, iVideoDuration, strStereoMode, strHdrType) VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, '', ?7)",
+                )?;
+                stmt.execute(params![file_id, codec, aspect, width, height, duration, hdr])?;
+            }
+            "Audio" => {
+                let codec = s.normalized_audio_codec();
+                let channels = s.channels.unwrap_or(2);
+                let lang = s.language.as_deref().unwrap_or("");
+                let mut stmt = tx.prepare_cached(
+                    "INSERT INTO streamdetails (idFile, iStreamType, strAudioCodec, iAudioChannels, strAudioLanguage) VALUES (?1, 1, ?2, ?3, ?4)",
+                )?;
+                stmt.execute(params![file_id, codec, channels, lang])?;
+            }
+            "Subtitle" => {
+                let lang = s.language.as_deref().unwrap_or("");
+                let mut stmt = tx.prepare_cached(
+                    "INSERT INTO streamdetails (idFile, iStreamType, strSubtitleLanguage) VALUES (?1, 2, ?2)",
+                )?;
+                stmt.execute(params![file_id, lang])?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn userdata(item: &JellyfinItem) -> (Option<i32>, Option<String>, i64) {
     match &item.user_data {
         Some(ud) => (
@@ -594,5 +645,117 @@ impl MapDb {
             params![chrono::Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::jellyfin::types::MediaStream;
+
+    #[test]
+    fn insert_movie_populates_streamdetails() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("test_schema.db");
+        let mut conn = open_fresh_db(&db_path).unwrap();
+        let mut cache = FkCache::init(&conn).unwrap();
+
+        let cfg = Config::default();
+        let client = JellyfinClient::new(&cfg).unwrap();
+
+        let item = JellyfinItem {
+            id: "m1".into(),
+            name: "Test Movie 4K".into(),
+            item_type: "Movie".into(),
+            overview: Some("Plot".into()),
+            year: Some(2024),
+            premiered: Some("2024-01-01".into()),
+            date_created: None,
+            runtime_ticks: Some(7200 * 10_000_000),
+            mpaa: Some("PG-13".into()),
+            community_rating: Some(8.5),
+            genres: Some(vec!["Action".into()]),
+            studios: None,
+            people: None,
+            user_data: None,
+            series_id: None,
+            series_name: None,
+            parent_id: None,
+            season_id: None,
+            parent_index: None,
+            index_number: None,
+            provider_ids: None,
+            media_sources: None,
+            media_streams: Some(vec![
+                MediaStream {
+                    stream_type: "Video".into(),
+                    index: 0,
+                    language: Some("eng".into()),
+                    codec: Some("hevc".into()),
+                    is_external: false,
+                    is_text_subtitle: false,
+                    supports_external_stream: false,
+                    delivery_url: None,
+                    is_default: true,
+                    is_forced: false,
+                    width: Some(3840),
+                    height: Some(2160),
+                    channels: None,
+                    aspect_ratio: Some("16:9".into()),
+                    profile: Some("Main 10".into()),
+                    video_range_type: Some("DOVI".into()),
+                    dv_profile: Some(serde_json::json!(7)),
+                },
+                MediaStream {
+                    stream_type: "Audio".into(),
+                    index: 1,
+                    language: Some("eng".into()),
+                    codec: Some("truehd".into()),
+                    is_external: false,
+                    is_text_subtitle: false,
+                    supports_external_stream: false,
+                    delivery_url: None,
+                    is_default: true,
+                    is_forced: false,
+                    width: None,
+                    height: None,
+                    channels: Some(8),
+                    aspect_ratio: None,
+                    profile: Some("Dolby TrueHD + Dolby Atmos".into()),
+                    video_range_type: None,
+                    dv_profile: None,
+                },
+            ]),
+            primary_version_id: None,
+        };
+
+        bulk_insert_items(&mut conn, &mut cache, &client, &[item], 15).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM streamdetails", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let (v_codec, v_width, v_hdr): (String, i64, String) = conn
+            .query_row(
+                "SELECT strVideoCodec, iVideoWidth, strHdrType FROM streamdetails WHERE iStreamType = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(v_codec, "hevc");
+        assert_eq!(v_width, 3840);
+        assert_eq!(v_hdr, "dolbyvision");
+
+        let (a_codec, a_channels): (String, i64) = conn
+            .query_row(
+                "SELECT strAudioCodec, iAudioChannels FROM streamdetails WHERE iStreamType = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(a_codec, "truehd");
+        assert_eq!(a_channels, 8);
     }
 }

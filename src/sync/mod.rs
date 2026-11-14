@@ -19,10 +19,10 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 /// Full metadata for movies / series / boxsets (People joins are expensive on episodes).
-const SYNC_FIELDS_FULL: &str = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Genres,Studios,People,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear";
+const SYNC_FIELDS_FULL: &str = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Genres,Studios,People,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear,MediaStreams";
 
 /// Lean fields for Season/Episode — no People/Studios/Genres (huge JF JOIN cost).
-const SYNC_FIELDS_LEAN: &str = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear";
+const SYNC_FIELDS_LEAN: &str = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear,MediaStreams";
 
 /// Commit SQLite every N items inside a pass (fewer fsyncs on eMMC).
 const SQLITE_COMMIT_EVERY: usize = 4500;
