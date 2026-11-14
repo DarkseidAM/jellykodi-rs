@@ -176,12 +176,6 @@ fn insert_series(
     client: &JellyfinClient,
     item: &JellyfinItem,
 ) -> Result<()> {
-    if cache.shows.contains_key(&item.id) {
-        return Ok(());
-    }
-    let show_id = cache.next_show;
-    cache.next_show += 1;
-    cache.shows.insert(item.id.clone(), show_id);
     let genres = item
         .genres
         .as_ref()
@@ -192,6 +186,41 @@ fn insert_series(
         .as_ref()
         .map(|s| s.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(" / "))
         .unwrap_or_default();
+
+    // Seasons often arrive before Series and create empty placeholders — backfill, don't skip.
+    if let Some(&show_id) = cache.shows.get(&item.id) {
+        let rating_id = insert_rating(tx, cache, show_id, "tvshow", item)?;
+        let uniqueid_id = insert_uniqueid(tx, cache, show_id, "tvshow", item)?;
+        tx.execute(
+            "UPDATE tvshow SET c00=?1, c01=?2, c04=?3, c05=?4, c08=?5, c12=?6, c13=?7, c14=?8 WHERE idShow=?9",
+            params![
+                item.name,
+                item.overview.as_deref().unwrap_or(""),
+                rating_id.map(|id| id.to_string()).unwrap_or_default(),
+                item.premiered.as_deref().unwrap_or(""),
+                genres,
+                uniqueid_id.map(|id| id.to_string()).unwrap_or_default(),
+                item.mpaa.as_deref().unwrap_or(""),
+                studios,
+                show_id
+            ],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO tvshowlinkpath (idShow, idPath) VALUES (?1,?2)",
+            params![show_id, cache.tv_path_id],
+        )?;
+        // Replace placeholder art with real series art.
+        tx.execute(
+            "DELETE FROM art WHERE media_id=?1 AND media_type='tvshow'",
+            params![show_id],
+        )?;
+        insert_art(tx, show_id, "tvshow", client, &item.id)?;
+        return Ok(());
+    }
+
+    let show_id = cache.next_show;
+    cache.next_show += 1;
+    cache.shows.insert(item.id.clone(), show_id);
     let rating_id = insert_rating(tx, cache, show_id, "tvshow", item)?;
     let uniqueid_id = insert_uniqueid(tx, cache, show_id, "tvshow", item)?;
     // c04=rating_id, c05=premiered, c08=genre, c12=uniqueid_id, c13=mpaa, c14=studio
