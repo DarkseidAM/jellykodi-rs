@@ -1,0 +1,23 @@
+msgid ""
+msgstr ""
+"Language: en_GB\n"
+
+msgctxt "#32001"
+msgid "Jellyfin"
+msgstr "Jellyfin"
+
+msgctxt "#32002"
+msgid "Server URL"
+msgstr "Server URL"
+
+msgctxt "#32003"
+msgid "User ID"
+msgstr "User ID"
+
+msgctxt "#32004"
+msgid "Access token"
+msgstr "Access token"
+
+msgctxt "#32005"
+msgid "Device ID"
+msgstr "Device ID"

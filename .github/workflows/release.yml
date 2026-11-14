@@ -1,0 +1,88 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.100.0"
+
+jobs:
+  build-aarch64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install cross linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release aarch64
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          rustc --version
+          cargo build --release --target aarch64-unknown-linux-gnu
+          aarch64-linux-gnu-strip -s target/aarch64-unknown-linux-gnu/release/jellykodi-rs || true
+
+      - name: Package Kodi add-on zip
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then VERSION="0.1.0-dev"; fi
+          STAGE=$(mktemp -d)
+          ADDON="$STAGE/plugin.video.jellykodi"
+          mkdir -p "$ADDON/bin" "$ADDON/resources/language/resource.language.en_gb"
+          cp plugin.video.jellykodi/addon.xml "$ADDON/"
+          cp plugin.video.jellykodi/default.py "$ADDON/"
+          cp plugin.video.jellykodi/service.py "$ADDON/"
+          cp plugin.video.jellykodi/resources/settings.xml "$ADDON/resources/"
+          cp plugin.video.jellykodi/resources/language/resource.language.en_gb/strings.po \
+            "$ADDON/resources/language/resource.language.en_gb/"
+          # optional icon
+          if [ -f plugin.video.jellykodi/resources/icon.png ]; then
+            cp plugin.video.jellykodi/resources/icon.png "$ADDON/resources/"
+          fi
+          cp target/aarch64-unknown-linux-gnu/release/jellykodi-rs "$ADDON/bin/"
+          chmod 755 "$ADDON/bin/jellykodi-rs"
+          # bump version in addon.xml for tags
+          sed -i "s/version=\"0.1.0\"/version=\"${VERSION}\"/" "$ADDON/addon.xml" || true
+          (cd "$STAGE" && zip -r "$GITHUB_WORKSPACE/plugin.video.jellykodi-${VERSION}.zip" plugin.video.jellykodi)
+          echo "ZIP=plugin.video.jellykodi-${VERSION}.zip" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin.video.jellykodi-aarch64
+          path: plugin.video.jellykodi-*.zip
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: plugin.video.jellykodi-*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test-host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test

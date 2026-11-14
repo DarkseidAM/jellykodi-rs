@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="plugin.video.jellykodi" name="JellyKodi Hybrid (Rust)" version="0.1.0" provider-name="DarkseidAM">
+  <requires>
+    <import addon="xbmc.python" version="3.0.1"/>
+  </requires>
+  <extension point="xbmc.python.pluginsource" library="default.py">
+    <provides>video</provides>
+  </extension>
+  <extension point="xbmc.service" library="service.py" start="login"/>
+  <extension point="xbmc.addon.metadata">
+    <reuselanguageinvoker>true</reuselanguageinvoker>
+    <platform>all</platform>
+    <summary lang="en_GB">Hybrid Rust-backed Jellyfin 12 native DB sync + instant widgets</summary>
+    <description lang="en_GB">Pairs a jellykodi-rs sidecar with a thin Python shim for CoreELEC. Talks to Jellyfin 12 via modern MediaBrowser Authorization only.</description>
+    <license>MIT</license>
+    <source>https://github.com/DarkseidAM/jellykodi-rs</source>
+    <assets>
+      <icon>resources/icon.png</icon>
+    </assets>
+  </extension>
+</addon>
