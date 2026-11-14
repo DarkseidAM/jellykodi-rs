@@ -9,6 +9,11 @@ use std::path::Path;
 /// Slimmer hand-rolled schemas lack `version` and cause Kodi to error on open.
 const SCHEMA: &str = include_str!("myvideos149.sql");
 
+/// Kodi system "Standard" video version type (MyVideos ≥121 / Omega+).
+const VIDEO_VERSION_ID_DEFAULT: i64 = 40400;
+/// MyVideos150 (Piers): VideoAssetType::VERSION == 1 (was 0 on Omega).
+const VIDEO_ASSET_TYPE_VERSION: i64 = 1;
+
 pub struct FkCache {
     actors: FxHashMap<String, i64>,
     shows: FxHashMap<String, i64>, // jellyfin series id -> idShow
@@ -20,6 +25,8 @@ pub struct FkCache {
     next_season: i64,
     next_episode: i64,
     next_set: i64,
+    next_rating: i64,
+    next_uniqueid: i64,
     movie_path_id: i64,
     tv_path_id: i64,
 }
@@ -40,6 +47,11 @@ impl FkCache {
             "INSERT OR IGNORE INTO path (idPath, strPath, strContent, strScraper) VALUES (2, 'plugin://plugin.video.jellykodi/tvshows/', 'tvshows', 'metadata.local')",
             [],
         )?;
+        // Required for movie_view INNER JOIN on MyVideos150 — without this, movies are invisible.
+        conn.execute(
+            "INSERT OR IGNORE INTO videoversiontype (id, name, owner, itemType) VALUES (?1, 'Standard', 0, ?2)",
+            params![VIDEO_VERSION_ID_DEFAULT, VIDEO_ASSET_TYPE_VERSION],
+        )?;
         Ok(Self {
             actors: FxHashMap::default(),
             shows: FxHashMap::default(),
@@ -51,6 +63,8 @@ impl FkCache {
             next_season: 1,
             next_episode: 1,
             next_set: 1,
+            next_rating: 1,
+            next_uniqueid: 1,
             movie_path_id: 1,
             tv_path_id: 2,
         })
@@ -116,19 +130,33 @@ fn insert_movie(
         .as_ref()
         .map(|s| s.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(" / "))
         .unwrap_or_default();
+    let rating_id = insert_rating(tx, cache, movie_id, "movie", item)?;
+    let uniqueid_id = insert_uniqueid(tx, cache, movie_id, "movie", item)?;
     tx.execute(
-        "INSERT INTO movie (idMovie, idFile, c00, c01, c07, c11, c12, c14, c18, premiered) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        "INSERT INTO movie (idMovie, idFile, c00, c01, c05, c07, c09, c11, c12, c14, c18, premiered) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         params![
             movie_id,
             file_id,
             item.name,
             item.overview.as_deref().unwrap_or(""),
+            rating_id.map(|id| id.to_string()).unwrap_or_default(),
             item.year.unwrap_or(0).to_string(),
+            uniqueid_id.map(|id| id.to_string()).unwrap_or_default(),
             duration.to_string(),
             item.mpaa.as_deref().unwrap_or(""),
             genres,
             studios,
             item.premiered.as_deref().unwrap_or("")
+        ],
+    )?;
+    // MyVideos150 movie_view INNER JOINs videoversion + videoversiontype.
+    tx.execute(
+        "INSERT INTO videoversion (idFile, idMedia, media_type, itemType, idType) VALUES (?1,?2,'movie',?3,?4)",
+        params![
+            file_id,
+            movie_id,
+            VIDEO_ASSET_TYPE_VERSION,
+            VIDEO_VERSION_ID_DEFAULT
         ],
     )?;
     insert_art(tx, movie_id, "movie", client, &item.id)?;
@@ -159,16 +187,31 @@ fn insert_series(
         .as_ref()
         .map(|g| g.join(" / "))
         .unwrap_or_default();
+    let studios = item
+        .studios
+        .as_ref()
+        .map(|s| s.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(" / "))
+        .unwrap_or_default();
+    let rating_id = insert_rating(tx, cache, show_id, "tvshow", item)?;
+    let uniqueid_id = insert_uniqueid(tx, cache, show_id, "tvshow", item)?;
+    // c04=rating_id, c05=premiered, c08=genre, c12=uniqueid_id, c13=mpaa, c14=studio
     tx.execute(
-        "INSERT INTO tvshow (idShow, c00, c01, c05, c08, c14) VALUES (?1,?2,?3,?4,?5,?6)",
+        "INSERT INTO tvshow (idShow, c00, c01, c04, c05, c08, c12, c13, c14) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         params![
             show_id,
             item.name,
             item.overview.as_deref().unwrap_or(""),
+            rating_id.map(|id| id.to_string()).unwrap_or_default(),
             item.premiered.as_deref().unwrap_or(""),
             genres,
-            item.mpaa.as_deref().unwrap_or("")
+            uniqueid_id.map(|id| id.to_string()).unwrap_or_default(),
+            item.mpaa.as_deref().unwrap_or(""),
+            studios
         ],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO tvshowlinkpath (idShow, idPath) VALUES (?1,?2)",
+        params![show_id, cache.tv_path_id],
     )?;
     insert_art(tx, show_id, "tvshow", client, &item.id)?;
     Ok(())
@@ -288,6 +331,54 @@ fn insert_boxset(
     Ok(())
 }
 
+fn insert_rating(
+    tx: &rusqlite::Transaction<'_>,
+    cache: &mut FkCache,
+    media_id: i64,
+    media_type: &str,
+    item: &JellyfinItem,
+) -> Result<Option<i64>> {
+    let Some(rating) = item.community_rating else {
+        return Ok(None);
+    };
+    let id = cache.next_rating;
+    cache.next_rating += 1;
+    tx.execute(
+        "INSERT INTO rating (rating_id, media_id, media_type, rating_type, rating, votes) VALUES (?1,?2,?3,'default',?4,0)",
+        params![id, media_id, media_type, rating],
+    )?;
+    Ok(Some(id))
+}
+
+fn insert_uniqueid(
+    tx: &rusqlite::Transaction<'_>,
+    cache: &mut FkCache,
+    media_id: i64,
+    media_type: &str,
+    item: &JellyfinItem,
+) -> Result<Option<i64>> {
+    let Some(providers) = item.provider_ids.as_ref().and_then(|v| v.as_object()) else {
+        return Ok(None);
+    };
+    // Prefer Imdb then Tmdb then first available — matches jellyfin-kodi default uniqueid.
+    let (ptype, value) = if let Some(v) = providers.get("Imdb").and_then(|x| x.as_str()) {
+        ("imdb", v)
+    } else if let Some(v) = providers.get("Tmdb").and_then(|x| x.as_str()) {
+        ("tmdb", v)
+    } else if let Some(v) = providers.get("Tvdb").and_then(|x| x.as_str()) {
+        ("tvdb", v)
+    } else {
+        return Ok(None);
+    };
+    let id = cache.next_uniqueid;
+    cache.next_uniqueid += 1;
+    tx.execute(
+        "INSERT INTO uniqueid (uniqueid_id, media_id, media_type, value, type) VALUES (?1,?2,?3,?4,?5)",
+        params![id, media_id, media_type, value, ptype],
+    )?;
+    Ok(Some(id))
+}
+
 fn insert_art(
     tx: &rusqlite::Transaction<'_>,
     media_id: i64,
@@ -295,8 +386,13 @@ fn insert_art(
     client: &JellyfinClient,
     item_id: &str,
 ) -> Result<()> {
+    // jellyfin-kodi also writes thumb(=Primary), banner, clearlogo, landscape, discart.
     tx.execute(
         "INSERT INTO art (media_id, media_type, type, url) VALUES (?1,?2,'poster',?3)",
+        params![media_id, media_type, client.image_url(item_id, "Primary", 720)],
+    )?;
+    tx.execute(
+        "INSERT INTO art (media_id, media_type, type, url) VALUES (?1,?2,'thumb',?3)",
         params![media_id, media_type, client.image_url(item_id, "Primary", 720)],
     )?;
     tx.execute(
