@@ -212,8 +212,30 @@ def run_service() -> None:
 
     player = UnifiedJellyPlayer()
     monitor = xbmc.Monitor()
+    widgets_primed = False
     try:
         while not monitor.abortRequested():
+            # After daemon is up: refresh widget cache, then bounce Home once so
+            # Arctic right-side rows (hidden while NumItems==0 from boot race)
+            # re-query plugin:// paths. Guarded so skin/service restarts do not loop.
+            if not widgets_primed and daemon_healthy():
+                try:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                        s.settimeout(90.0)
+                        s.connect(sock_path())
+                        s.sendall(b"REFRESH_WIDGETS\n")
+                        s.recv(4096)
+                    flag = os.path.join(profile(), ".home_widget_boot_refresh")
+                    if not os.path.exists(flag):
+                        open(flag, "w").close()
+                        xbmc.executebuiltin("ReplaceWindow(Home)")
+                        xbmc.log(
+                            "[jellykodi] primed widgets + ReplaceWindow(Home)",
+                            xbmc.LOGINFO,
+                        )
+                    widgets_primed = True
+                except OSError as exc:
+                    xbmc.log(f"[jellykodi] widget prime defer: {exc}", xbmc.LOGWARNING)
             if proc is not None and proc.poll() is not None:
                 xbmc.log(
                     f"[jellykodi] daemon exited code={proc.returncode}; restarting",

@@ -31,6 +31,8 @@ docs/internal/
 *.swp
 .idea/
 .vscode/
+__pycache__/
+*.pyc
 
 plugin.video.jellykodi-*.zip
 /target/
