@@ -152,10 +152,22 @@ def render_items(items, content: str = "videos") -> None:
                                     codec=v_codec,
                                     aspect=v_aspect,
                                     duration=duration,
+                                    hdrtype=v_hdr,
                                 )
                             )
                         except Exception:
-                            pass
+                            try:
+                                tag.addVideoStream(
+                                    xbmc.VideoStreamDetail(
+                                        width=v_w,
+                                        height=v_h,
+                                        codec=v_codec,
+                                        aspect=v_aspect,
+                                        duration=duration,
+                                    )
+                                )
+                            except Exception:
+                                pass
                         try:
                             li.addStreamInfo(
                                 "video",
@@ -165,6 +177,7 @@ def render_items(items, content: str = "videos") -> None:
                                     "height": v_h,
                                     "aspect": v_aspect,
                                     "duration": duration,
+                                    "hdrtype": v_hdr,
                                 },
                             )
                         except Exception:
