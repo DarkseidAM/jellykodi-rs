@@ -189,8 +189,9 @@ impl JellyfinClient {
         limit: u32,
         fields: &str,
     ) -> Result<Vec<JellyfinItem>> {
+        // GroupItems=false: Episode Latest otherwise collapses to Series folders.
         let q = format!(
-            "/Users/{}/Items/Latest?Limit={}&IncludeItemTypes={}&Fields={}",
+            "/Users/{}/Items/Latest?Limit={}&IncludeItemTypes={}&Fields={}&GroupItems=false",
             self.user_id,
             limit,
             urlencoding(include_types),
