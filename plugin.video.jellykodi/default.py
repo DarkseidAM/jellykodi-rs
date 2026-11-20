@@ -254,9 +254,12 @@ def render_items(items, content: str = "videos") -> None:
             unique_ids = it.get("unique_ids") or {}
             if unique_ids and isinstance(unique_ids, dict):
                 try:
-                    li.setUniqueIDs(unique_ids, defaultrating="imdb")
+                    tag.setUniqueIDs(unique_ids, defaultrating="imdb")
                 except Exception:
-                    pass
+                    try:
+                        li.setUniqueIDs(unique_ids, defaultrating="imdb")
+                    except Exception:
+                        pass
 
             if media == "movie" and year > 0:
                 li.setLabel2(str(year))
@@ -447,13 +450,26 @@ def resolve_play(item_id: str) -> None:
             except Exception:
                 pass
 
-    # External Subtitles (Option 1: direct URL streaming)
+    # External Subtitles (Option 1: direct URL streaming for text formats only)
     subs = []
     for s in play.get("subtitles") or []:
-        if isinstance(s, dict) and s.get("url"):
-            subs.append(s["url"])
-        elif isinstance(s, str) and s:
-            subs.append(s)
+        url = ""
+        codec = ""
+        if isinstance(s, dict):
+            url = s.get("url") or ""
+            codec = (s.get("codec") or "").lower()
+        elif isinstance(s, str):
+            url = s
+        if not url:
+            continue
+        # Never feed graphic/bitmap subtitles to Kodi's setSubtitles — causes 20-30s curl freeze
+        if codec in ("pgs", "pgssub", "dvdsub", "dvd_subtitle", "dvb_subtitle", "vobsub"):
+            continue
+        url_lower = url.lower()
+        if any(b in url_lower for b in [".pgssub", ".pgs", ".dvdsub", ".vobsub"]):
+            continue
+        subs.append(url)
+
     if subs:
         try:
             li.setSubtitles(subs)

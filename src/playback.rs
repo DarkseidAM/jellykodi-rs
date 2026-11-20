@@ -157,6 +157,13 @@ fn stream_url_for(
     ))
 }
 
+fn is_text_subtitle_codec(codec: &str) -> bool {
+    matches!(
+        codec.to_ascii_lowercase().as_str(),
+        "subrip" | "srt" | "vtt" | "ass" | "ssa" | "sub" | "smi" | "sami"
+    )
+}
+
 fn external_subs(
     client: &JellyfinClient,
     item_id: &str,
@@ -169,7 +176,12 @@ fn external_subs(
         .iter()
         .filter(|s| {
             s.stream_type == "Subtitle"
-                && (s.is_external || s.supports_external_stream)
+                && s.is_external
+                && (s.is_text_subtitle
+                    || s.codec
+                        .as_deref()
+                        .map(is_text_subtitle_codec)
+                        .unwrap_or(false))
         })
         .map(|s| {
             let url = if let Some(delivery_url) = &s.delivery_url {
@@ -320,5 +332,94 @@ mod tests {
         assert_eq!(res.video[0].hdr_type, "dolbyvision");
         assert_eq!(res.audio[0].channels, 8);
         assert_eq!(res.subtitle[0].language, "eng");
+    }
+
+    #[test]
+    fn external_subs_only_includes_external_text_subtitles() {
+        let cfg = crate::config::Config {
+            server_url: "http://localhost:8096".into(),
+            access_token: "token".into(),
+            ..Default::default()
+        };
+        let client = JellyfinClient::new(&cfg).unwrap();
+        let source = MediaSource {
+            id: "source1".into(),
+            container: Some("mkv".into()),
+            path: None,
+            size: None,
+            bitrate: None,
+            supports_direct_play: true,
+            supports_direct_stream: true,
+            direct_stream_url: None,
+            transcoding_url: None,
+            media_streams: Some(vec![
+                // 1. Internal PGS subtitle - MUST be excluded to prevent "Please wait" hang
+                MediaStream {
+                    stream_type: "Subtitle".into(),
+                    index: 1,
+                    language: Some("eng".into()),
+                    codec: Some("pgssub".into()),
+                    is_external: false,
+                    is_text_subtitle: false,
+                    supports_external_stream: true,
+                    delivery_url: None,
+                    is_default: false,
+                    is_forced: false,
+                    width: None,
+                    height: None,
+                    channels: None,
+                    aspect_ratio: None,
+                    profile: None,
+                    video_range_type: None,
+                    dv_profile: None,
+                },
+                // 2. External PGS subtitle - Graphic format, MUST be excluded
+                MediaStream {
+                    stream_type: "Subtitle".into(),
+                    index: 2,
+                    language: Some("spa".into()),
+                    codec: Some("pgs".into()),
+                    is_external: true,
+                    is_text_subtitle: false,
+                    supports_external_stream: true,
+                    delivery_url: Some("/Videos/item1/source1/Subtitles/2/Stream.pgs".into()),
+                    is_default: false,
+                    is_forced: false,
+                    width: None,
+                    height: None,
+                    channels: None,
+                    aspect_ratio: None,
+                    profile: None,
+                    video_range_type: None,
+                    dv_profile: None,
+                },
+                // 3. External SRT subtitle - Text format, MUST be included
+                MediaStream {
+                    stream_type: "Subtitle".into(),
+                    index: 3,
+                    language: Some("fra".into()),
+                    codec: Some("subrip".into()),
+                    is_external: true,
+                    is_text_subtitle: true,
+                    supports_external_stream: true,
+                    delivery_url: Some("/Videos/item1/source1/Subtitles/3/Stream.srt".into()),
+                    is_default: true,
+                    is_forced: false,
+                    width: None,
+                    height: None,
+                    channels: None,
+                    aspect_ratio: None,
+                    profile: None,
+                    video_range_type: None,
+                    dv_profile: None,
+                },
+            ]),
+        };
+
+        let subs = external_subs(&client, "item1", &source);
+        assert_eq!(subs.len(), 1, "Only external text subtitles must be included");
+        assert_eq!(subs[0].codec, "subrip");
+        assert_eq!(subs[0].language, "fra");
+        assert_eq!(subs[0].url, "http://localhost:8096/Videos/item1/source1/Subtitles/3/Stream.srt");
     }
 }
