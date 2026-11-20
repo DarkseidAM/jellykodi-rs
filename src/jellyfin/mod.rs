@@ -322,13 +322,15 @@ impl JellyfinClient {
     ) -> Result<()> {
         let mut body = serde_json::json!({
             "ItemId": item_id,
-            "PositionTicks": position_ticks,
             "CanSeek": true,
             "IsPaused": false,
             "IsMuted": false,
             "PlayMethod": "DirectPlay",
             "QueueableMediaTypes": "Video",
         });
+        if position_ticks > 0 {
+            body["PositionTicks"] = serde_json::json!(position_ticks);
+        }
         if !media_source_id.is_empty() {
             body["MediaSourceId"] = serde_json::json!(media_source_id);
         }

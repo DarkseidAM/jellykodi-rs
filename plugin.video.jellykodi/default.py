@@ -304,6 +304,7 @@ def render_browse(item_id: str) -> None:
 
 
 def resolve_play(item_id: str) -> None:
+    xbmc.log(f"[jellykodi] resolve_play ENTER item_id={item_id} sys.argv={sys.argv}", xbmc.LOGINFO)
     if not item_id:
         xbmcplugin.setResolvedUrl(HANDLE, False, xbmcgui.ListItem())
         return
@@ -334,20 +335,29 @@ def resolve_play(item_id: str) -> None:
     duration = int(play.get("duration_secs") or 0)
     start_offset = 0
 
-    # C MODE: Native Kodi Library click (videodb://) - Kodi handles bookmark dialog and sets sys.argv[3]
-    if len(sys.argv) > 3 and "resume:" in sys.argv[3]:
-        is_resume = sys.argv[3].split("resume:")[1].lower() == "true"
-        start_offset = resume_pos if is_resume else 0
-    # A MODE: Direct Jellyfin widget click (plugin://) - Context Menu Dialog
-    elif resume_pos > 0 and duration > resume_pos:
+    xbmc.log(
+        f"[jellykodi] resolve_play parsed: resume_pos={resume_pos} duration={duration} argv={sys.argv}",
+        xbmc.LOGINFO,
+    )
+
+    # If Kodi native library already prompted and passed resume:true, resume directly.
+    if len(sys.argv) > 3 and "resume:true" in sys.argv[3]:
+        start_offset = resume_pos
+        xbmc.log(f"[jellykodi] resolve_play explicit resume:true -> start_offset={start_offset}", xbmc.LOGINFO)
+    # Otherwise, for widget clicks (where Kodi passes resume:false by default without prompting), prompt the user:
+    elif resume_pos > 0:
         mins, secs = divmod(resume_pos, 60)
         hours, mins = divmod(mins, 60)
         time_str = f"{hours}:{mins:02d}:{secs:02d}" if hours else f"{mins}:{secs:02d}"
-        choice = xbmcgui.Dialog().contextmenu([f"Resume from {time_str}", "Play from beginning"])
+        xbmc.log(f"[jellykodi] resolve_play prompting resume at {time_str}", xbmc.LOGINFO)
+        choice = xbmcgui.Dialog().select("Resume", [f"Resume from {time_str}", "Play from beginning"])
+        xbmc.log(f"[jellykodi] resolve_play user choice={choice}", xbmc.LOGINFO)
         if choice == -1:  # Cancelled / Back
             xbmcplugin.setResolvedUrl(HANDLE, False, xbmcgui.ListItem())
             return
         start_offset = resume_pos if choice == 0 else 0
+    else:
+        xbmc.log(f"[jellykodi] resolve_play no resume point (resume_pos={resume_pos})", xbmc.LOGINFO)
 
     li = xbmcgui.ListItem(path=play["stream_url"], offscreen=True)
     li.setProperty("IsPlayable", "true")
@@ -445,6 +455,7 @@ def resolve_play(item_id: str) -> None:
         win.setProperty("jellykodi.play_session_id", play.get("play_session_id") or "")
         win.setProperty("jellykodi.stream_url", play["stream_url"])
         win.setProperty("jellykodi.duration", str(duration))
+        win.setProperty("jellykodi.start_offset", str(start_offset))
     except Exception:
         pass
 

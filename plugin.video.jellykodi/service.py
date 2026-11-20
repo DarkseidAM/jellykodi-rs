@@ -171,6 +171,15 @@ class UnifiedJellyPlayer(xbmc.Player):
                     self.current_pos = self.getTime()
                 except RuntimeError:
                     self.current_pos = 0.0
+                try:
+                    win = xbmcgui.Window(10000)
+                    req_offset = float(win.getProperty("jellykodi.start_offset") or 0.0)
+                    if req_offset > 5.0 and self.current_pos < 3.0:
+                        xbmc.log(f"[jellykodi] onAVStarted seeking to start_offset={req_offset}", xbmc.LOGINFO)
+                        self.seekTime(req_offset)
+                        self.current_pos = req_offset
+                except Exception as exc:
+                    xbmc.log(f"[jellykodi] seekTime error: {exc}", xbmc.LOGWARNING)
                 notify_daemon(
                     {
                         "event": "started",
@@ -330,12 +339,7 @@ class UnifiedJellyPlayer(xbmc.Player):
             win.clearProperty("jellykodi.media_source_id")
             win.clearProperty("jellykodi.play_session_id")
             win.clearProperty("jellykodi.duration")
-            win.clearProperty("jellykodi.stream_url")
-        except Exception:
-            pass
-            win.clearProperty("jellykodi.media_source_id")
-            win.clearProperty("jellykodi.play_session_id")
-            win.clearProperty("jellykodi.duration")
+            win.clearProperty("jellykodi.start_offset")
             win.clearProperty("jellykodi.stream_url")
         except Exception:
             pass
