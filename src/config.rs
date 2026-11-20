@@ -42,7 +42,7 @@ impl Default for Config {
             playback_timeout_secs: 20,
             http_timeout_secs: 60,
             sync_page_size: 1000,
-            sync_concurrency: 8,
+            sync_concurrency: 3,
             sync_concurrency_playing: 1,
             cast_limit: 15,
             kodisync_poll_secs: 300,

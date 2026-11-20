@@ -12,6 +12,7 @@ use crate::error::{JellyError, Result};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
 use std::time::Duration;
+use tracing::warn;
 use types::*;
 use url::form_urlencoded;
 
@@ -91,7 +92,9 @@ impl JellyfinClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(JellyError::Api(format!("{status} {url}: {body}")));
         }
-        Ok(resp.json().await?)
+        let bytes = resp.bytes().await?;
+        let parsed = serde_json::from_slice(&bytes)?;
+        Ok(parsed)
     }
 
     async fn post_json<T: serde::de::DeserializeOwned, B: serde::Serialize>(
@@ -111,7 +114,9 @@ impl JellyfinClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(JellyError::Api(format!("{status} {url}: {body}")));
         }
-        Ok(resp.json().await?)
+        let bytes = resp.bytes().await?;
+        let parsed = serde_json::from_slice(&bytes)?;
+        Ok(parsed)
     }
 
     async fn post_empty(&self, path: &str, body: &serde_json::Value) -> Result<()> {
@@ -165,7 +170,24 @@ impl JellyfinClient {
             urlencoding(fields),
             enable_total,
         );
-        self.get_json(&q).await
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            match self.get_json(&q).await {
+                Ok(env) => return Ok(env),
+                Err(e) if attempts < 4 => {
+                    warn!(
+                        attempt = attempts,
+                        error = %e,
+                        start_index,
+                        include_types,
+                        "transient error fetching items page; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(1500 * (attempts as u64))).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     pub async fn resume(&self, limit: u32, fields: &str) -> Result<ItemsEnvelope> {
