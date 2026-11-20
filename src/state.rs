@@ -67,6 +67,28 @@ impl AppState {
         }
     }
 
+    pub async fn get_cw_resume_pos(&self, item_id: &str) -> Option<i64> {
+        let map = self.widgets.read().await;
+        for key in &["continue_watching", "resume"] {
+            if let Some(cw_val) = map.get(*key)
+                && let Some(arr) = cw_val.as_array()
+            {
+                for it in arr {
+                    if it
+                        .get("plugin_url")
+                        .and_then(|u| u.as_str())
+                        .map(|u| u.contains(item_id))
+                        .unwrap_or(false)
+                        && let Some(pos) = it.get("resume_pos").and_then(|p| p.as_i64())
+                    {
+                        return Some(pos);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Optimistic in-memory update for continue_watching & resume widgets on playback stop.
     /// Eliminates network delay so home widgets are already refreshed when the user returns.
     pub async fn optimistic_update_cw(&self, item_id: &str, pos_secs: f64, duration_secs: f64) {

@@ -44,7 +44,11 @@ pub struct PlayResolve {
     pub streams: PlaybackStreams,
 }
 
-pub async fn resolve_play(client: &JellyfinClient, item_id: &str) -> Result<PlayResolve> {
+pub async fn resolve_play(
+    client: &JellyfinClient,
+    state: Option<&std::sync::Arc<crate::state::AppState>>,
+    item_id: &str,
+) -> Result<PlayResolve> {
     let (info_res, item_res) =
         tokio::join!(client.playback_info(item_id), client.get_item(item_id));
 
@@ -72,12 +76,18 @@ pub async fn resolve_play(client: &JellyfinClient, item_id: &str) -> Result<Play
         .unwrap_or(0)
         / 10_000_000;
 
-    let resume_pos_secs = item
+    let mut resume_pos_secs = item
         .as_ref()
         .and_then(|i| i.user_data.as_ref())
         .and_then(|u| u.position_ticks)
         .unwrap_or(0)
         / 10_000_000;
+
+    if let Some(s) = state
+        && let Some(opt_pos) = s.get_cw_resume_pos(item_id).await
+    {
+        resume_pos_secs = opt_pos;
+    }
 
     let title = item.as_ref().map(|i| i.name.clone()).unwrap_or_default();
     let plot = item

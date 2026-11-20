@@ -320,16 +320,21 @@ impl JellyfinClient {
         play_session_id: &str,
         position_ticks: i64,
     ) -> Result<()> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "ItemId": item_id,
-            "MediaSourceId": media_source_id,
-            "PlaySessionId": play_session_id,
             "PositionTicks": position_ticks,
             "CanSeek": true,
             "IsPaused": false,
             "IsMuted": false,
             "PlayMethod": "DirectPlay",
+            "QueueableMediaTypes": "Video",
         });
+        if !media_source_id.is_empty() {
+            body["MediaSourceId"] = serde_json::json!(media_source_id);
+        }
+        if !play_session_id.is_empty() {
+            body["PlaySessionId"] = serde_json::json!(play_session_id);
+        }
         self.post_empty("/Sessions/Playing", &body).await
     }
 
@@ -339,12 +344,11 @@ impl JellyfinClient {
         media_source_id: &str,
         play_session_id: &str,
         position_ticks: i64,
+        runtime_ticks: i64,
         is_paused: bool,
     ) -> Result<()> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "ItemId": item_id,
-            "MediaSourceId": media_source_id,
-            "PlaySessionId": play_session_id,
             "PositionTicks": position_ticks,
             "IsPaused": is_paused,
             "CanSeek": true,
@@ -352,6 +356,15 @@ impl JellyfinClient {
             "PlayMethod": "DirectPlay",
             "EventName": if is_paused { "Pause" } else { "TimeUpdate" },
         });
+        if !media_source_id.is_empty() {
+            body["MediaSourceId"] = serde_json::json!(media_source_id);
+        }
+        if !play_session_id.is_empty() {
+            body["PlaySessionId"] = serde_json::json!(play_session_id);
+        }
+        if runtime_ticks > 0 {
+            body["RunTimeTicks"] = serde_json::json!(runtime_ticks);
+        }
         self.post_empty("/Sessions/Playing/Progress", &body).await
     }
 
@@ -361,13 +374,21 @@ impl JellyfinClient {
         media_source_id: &str,
         play_session_id: &str,
         position_ticks: i64,
+        runtime_ticks: i64,
     ) -> Result<()> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "ItemId": item_id,
-            "MediaSourceId": media_source_id,
-            "PlaySessionId": play_session_id,
             "PositionTicks": position_ticks,
         });
+        if !media_source_id.is_empty() {
+            body["MediaSourceId"] = serde_json::json!(media_source_id);
+        }
+        if !play_session_id.is_empty() {
+            body["PlaySessionId"] = serde_json::json!(play_session_id);
+        }
+        if runtime_ticks > 0 {
+            body["RunTimeTicks"] = serde_json::json!(runtime_ticks);
+        }
         self.post_empty("/Sessions/Playing/Stopped", &body).await
     }
 

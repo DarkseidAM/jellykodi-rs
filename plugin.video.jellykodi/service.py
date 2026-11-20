@@ -115,13 +115,17 @@ def stop_stale_daemon() -> None:
 
 def notify_daemon(payload: dict) -> None:
     try:
+        xbmc.log(
+            f"[jellykodi] notify_daemon event={payload.get('event')} item={payload.get('item_id')} pos={payload.get('pos')}",
+            xbmc.LOGINFO,
+        )
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(2.0)
             s.connect(sock_path())
             s.sendall(b"EVENT " + json.dumps(payload).encode("utf-8") + b"\n")
             s.recv(4096)
-    except OSError:
-        pass
+    except Exception as exc:
+        xbmc.log(f"[jellykodi] notify_daemon error: {exc}", xbmc.LOGWARNING)
 
 
 class UnifiedJellyPlayer(xbmc.Player):
@@ -142,8 +146,24 @@ class UnifiedJellyPlayer(xbmc.Player):
             self.duration = float(win.getProperty("jellykodi.duration") or 0.0)
         except Exception:
             pass
+        if not self.item_id:
+            try:
+                f = self.getPlayingFile()
+                if "id=" in f:
+                    self.item_id = f.split("id=")[1].split("&")[0]
+                elif "/Videos/" in f:
+                    parts = f.split("/Videos/")[1].split("/")
+                    if parts:
+                        self.item_id = parts[0]
+            except Exception:
+                pass
+        xbmc.log(
+            f"[jellykodi] captured ids: item_id={self.item_id} session={self.play_session_id} dur={self.duration}",
+            xbmc.LOGINFO,
+        )
 
     def onAVStarted(self) -> None:
+        xbmc.log("[jellykodi] onAVStarted", xbmc.LOGINFO)
         if self.isPlayingVideo():
             self._capture_ids()
             if self.item_id:
@@ -163,12 +183,67 @@ class UnifiedJellyPlayer(xbmc.Player):
                     }
                 )
 
-    def onPlayBackPaused(self) -> None:
-        if self.item_id:
+    def onPlayBackSeek(self, time: int, seek_offset: int) -> None:
+        xbmc.log(f"[jellykodi] onPlayBackSeek time={time} seek_offset={seek_offset}", xbmc.LOGINFO)
+        if not self.item_id:
+            self._capture_ids()
+        if time:
+            self.current_pos = float(time) / 1000.0
+        else:
             try:
                 self.current_pos = self.getTime()
             except RuntimeError:
                 pass
+        try:
+            if self.duration <= 0.0:
+                self.duration = self.getTotalTime()
+        except Exception:
+            pass
+        xbmc.log(
+            f"[jellykodi] onPlayBackSeek resolved pos={self.current_pos:.1f}s dur={self.duration:.1f}s",
+            xbmc.LOGINFO,
+        )
+        if self.item_id:
+            notify_daemon(
+                {
+                    "event": "progress",
+                    "item_id": self.item_id,
+                    "media_source_id": self.media_source_id,
+                    "play_session_id": self.play_session_id,
+                    "pos": self.current_pos,
+                    "duration": self.duration,
+                }
+            )
+
+    def onPlayBackResumed(self) -> None:
+        xbmc.log("[jellykodi] onPlayBackResumed", xbmc.LOGINFO)
+        if not self.item_id:
+            self._capture_ids()
+        try:
+            self.current_pos = self.getTime()
+        except RuntimeError:
+            pass
+        if self.item_id:
+            notify_daemon(
+                {
+                    "event": "progress",
+                    "item_id": self.item_id,
+                    "media_source_id": self.media_source_id,
+                    "play_session_id": self.play_session_id,
+                    "pos": self.current_pos,
+                    "duration": self.duration,
+                }
+            )
+
+    def onPlayBackPaused(self) -> None:
+        xbmc.log("[jellykodi] onPlayBackPaused", xbmc.LOGINFO)
+        if not self.item_id:
+            self._capture_ids()
+        try:
+            self.current_pos = self.getTime()
+        except RuntimeError:
+            pass
+        if self.item_id:
             notify_daemon(
                 {
                     "event": "paused",
@@ -181,6 +256,9 @@ class UnifiedJellyPlayer(xbmc.Player):
             )
 
     def onPlayBackStopped(self) -> None:
+        xbmc.log(f"[jellykodi] onPlayBackStopped item_id={self.item_id} pos={self.current_pos}", xbmc.LOGINFO)
+        if not self.item_id:
+            self._capture_ids()
         if self.item_id:
             notify_daemon(
                 {
@@ -200,6 +278,9 @@ class UnifiedJellyPlayer(xbmc.Player):
             self._clear_session()
 
     def onPlayBackEnded(self) -> None:
+        xbmc.log(f"[jellykodi] onPlayBackEnded item_id={self.item_id}", xbmc.LOGINFO)
+        if not self.item_id:
+            self._capture_ids()
         if self.item_id:
             notify_daemon(
                 {
@@ -218,6 +299,9 @@ class UnifiedJellyPlayer(xbmc.Player):
             self._clear_session()
 
     def onPlayBackError(self) -> None:
+        xbmc.log(f"[jellykodi] onPlayBackError item_id={self.item_id}", xbmc.LOGINFO)
+        if not self.item_id:
+            self._capture_ids()
         if self.item_id:
             notify_daemon(
                 {
@@ -243,6 +327,12 @@ class UnifiedJellyPlayer(xbmc.Player):
         try:
             win = xbmcgui.Window(10000)
             win.clearProperty("jellykodi.item_id")
+            win.clearProperty("jellykodi.media_source_id")
+            win.clearProperty("jellykodi.play_session_id")
+            win.clearProperty("jellykodi.duration")
+            win.clearProperty("jellykodi.stream_url")
+        except Exception:
+            pass
             win.clearProperty("jellykodi.media_source_id")
             win.clearProperty("jellykodi.play_session_id")
             win.clearProperty("jellykodi.duration")
@@ -328,8 +418,12 @@ def run_service() -> None:
                         xbmc.LOGWARNING,
                     )
             if player.isPlayingVideo():
+                if not player.item_id:
+                    player._capture_ids()
                 try:
                     player.current_pos = player.getTime()
+                    if player.duration <= 0.0:
+                        player.duration = player.getTotalTime()
                     if _tick % 5 == 0 and player.item_id:
                         notify_daemon(
                             {

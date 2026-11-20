@@ -78,7 +78,7 @@ async fn dispatch(
         return Ok(serde_json::to_value(items)?);
     }
     if let Some(id) = line.strip_prefix("PLAY ") {
-        let play = playback::resolve_play(client, id.trim()).await?;
+        let play = playback::resolve_play(client, Some(state), id.trim()).await?;
         return Ok(serde_json::to_value(play)?);
     }
     if let Some(raw) = line.strip_prefix("EVENT ") {
@@ -132,6 +132,9 @@ async fn handle_event(
     let pos = v.get("pos").and_then(|x| x.as_f64()).unwrap_or(0.0);
     let duration = v.get("duration").and_then(|x| x.as_f64()).unwrap_or(0.0);
     let position_ticks = (pos * 10_000_000.0) as i64;
+    let duration_ticks = (duration * 10_000_000.0) as i64;
+
+    info!("ipc event={event} item={item_id} pos={pos:.1}s dur={duration:.1}s");
 
     match event {
         "started" => {
@@ -151,6 +154,7 @@ async fn handle_event(
                         &media_source_id,
                         &play_session_id,
                         position_ticks,
+                        duration_ticks,
                         paused,
                     )
                     .await;
@@ -169,9 +173,14 @@ async fn handle_event(
                 let msid = media_source_id.clone();
                 let psid = play_session_id.clone();
                 tokio::spawn(async move {
-                    let _ = c
-                        .reporting_stopped(&iid, &msid, &psid, position_ticks)
-                        .await;
+                    if let Err(e) = c
+                        .reporting_stopped(&iid, &msid, &psid, position_ticks, duration_ticks)
+                        .await
+                    {
+                        warn!("reporting_stopped failed for {iid}: {e}");
+                    } else {
+                        info!("reporting_stopped confirmed for {iid} at {position_ticks} ticks ({pos:.1}s)");
+                    }
                     let _ = widgets::refresh_all_widgets(&c, &s).await;
                 });
             }

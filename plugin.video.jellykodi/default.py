@@ -152,33 +152,7 @@ def render_items(items, content: str = "videos") -> None:
                                     codec=v_codec,
                                     aspect=v_aspect,
                                     duration=duration,
-                                    hdrtype=v_hdr,
                                 )
-                            )
-                        except Exception:
-                            try:
-                                tag.addVideoStream(
-                                    xbmc.VideoStreamDetail(
-                                        width=v_w,
-                                        height=v_h,
-                                        codec=v_codec,
-                                        aspect=v_aspect,
-                                        duration=duration,
-                                    )
-                                )
-                            except Exception:
-                                pass
-                        try:
-                            li.addStreamInfo(
-                                "video",
-                                {
-                                    "codec": v_codec,
-                                    "width": v_w,
-                                    "height": v_h,
-                                    "aspect": v_aspect,
-                                    "duration": duration,
-                                    "hdrtype": v_hdr,
-                                },
                             )
                         except Exception:
                             pass
@@ -196,17 +170,6 @@ def render_items(items, content: str = "videos") -> None:
                                     channels=a_ch,
                                     language=a_lang,
                                 )
-                            )
-                        except Exception:
-                            pass
-                        try:
-                            li.addStreamInfo(
-                                "audio",
-                                {
-                                    "codec": a_codec,
-                                    "channels": a_ch,
-                                    "language": a_lang,
-                                },
                             )
                         except Exception:
                             pass
@@ -256,10 +219,7 @@ def render_items(items, content: str = "videos") -> None:
                 try:
                     tag.setUniqueIDs(unique_ids, defaultrating="imdb")
                 except Exception:
-                    try:
-                        li.setUniqueIDs(unique_ids, defaultrating="imdb")
-                    except Exception:
-                        pass
+                    pass
 
             if media == "movie" and year > 0:
                 li.setLabel2(str(year))
@@ -404,8 +364,10 @@ def resolve_play(item_id: str) -> None:
             tag.setYear(int(play["year"]))
         if duration > 0:
             tag.setDuration(duration)
-        if resume_pos > 0:
-            tag.setResumePoint(float(resume_pos), float(duration))
+        if start_offset > 0:
+            tag.setResumePoint(float(start_offset), float(duration))
+        elif duration > 0:
+            tag.setResumePoint(0.0, float(duration))
     except Exception:
         pass
 
@@ -414,38 +376,37 @@ def resolve_play(item_id: str) -> None:
     if isinstance(streams, dict):
         for vt in streams.get("video") or []:
             try:
-                li.addStreamInfo(
-                    "video",
-                    {
-                        "codec": vt.get("codec", ""),
-                        "width": int(vt.get("width") or 0),
-                        "height": int(vt.get("height") or 0),
-                        "aspect": float(vt.get("aspect") or 1.78),
-                        "duration": duration,
-                        "hdrtype": vt.get("hdr_type", ""),
-                    },
+                tag.addVideoStream(
+                    xbmc.VideoStreamDetail(
+                        width=int(vt.get("width") or 0),
+                        height=int(vt.get("height") or 0),
+                        aspect=float(vt.get("aspect") or 1.78),
+                        duration=duration,
+                        codec=vt.get("codec", ""),
+                    )
                 )
+                hdr = vt.get("hdr_type")
+                if hdr:
+                    li.setProperty("video.hdrtype", str(hdr))
             except Exception:
                 pass
         for at in streams.get("audio") or []:
             try:
-                li.addStreamInfo(
-                    "audio",
-                    {
-                        "codec": at.get("codec", ""),
-                        "channels": int(at.get("channels") or 2),
-                        "language": at.get("language", ""),
-                    },
+                tag.addAudioStream(
+                    xbmc.AudioStreamDetail(
+                        codec=at.get("codec", ""),
+                        channels=int(at.get("channels") or 2),
+                        language=at.get("language", ""),
+                    )
                 )
             except Exception:
                 pass
         for st in streams.get("subtitle") or []:
             try:
-                li.addStreamInfo(
-                    "subtitle",
-                    {
-                        "language": st.get("language", ""),
-                    },
+                tag.addSubtitleStream(
+                    xbmc.SubtitleStreamDetail(
+                        language=st.get("language", ""),
+                    )
                 )
             except Exception:
                 pass
