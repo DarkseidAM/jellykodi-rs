@@ -17,7 +17,9 @@ const VIDEO_ASSET_TYPE_VERSION: i64 = 1;
 pub struct FkCache {
     actors: FxHashMap<String, i64>,
     shows: FxHashMap<String, i64>, // jellyfin series id -> idShow
+    shows_by_title: FxHashMap<String, i64>, // lowercased series title -> idShow (merges alternate series IDs)
     seasons: FxHashMap<String, i64>,
+    seasons_by_show_and_num: FxHashMap<(i64, i32), i64>, // (idShow, season_num) -> idSeason
     next_actor: i64,
     next_file: i64,
     next_movie: i64,
@@ -74,7 +76,9 @@ impl FkCache {
         Ok(Self {
             actors: FxHashMap::default(),
             shows: FxHashMap::default(),
+            shows_by_title: FxHashMap::default(),
             seasons: FxHashMap::default(),
+            seasons_by_show_and_num: FxHashMap::default(),
             next_actor: 1,
             next_file: 1,
             next_movie: 1,
@@ -214,8 +218,16 @@ fn insert_series(
         .map(|s| s.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(" / "))
         .unwrap_or_default();
 
-    // Seasons often arrive before Series and create empty placeholders — backfill, don't skip.
-    if let Some(&show_id) = cache.shows.get(&item.id) {
+    // Check if this show was already registered by ID or title (e.g. from an alternate library version or early season)
+    let existing_show_id = cache
+        .shows
+        .get(&item.id)
+        .copied()
+        .or_else(|| cache.shows_by_title.get(&item.name.trim().to_lowercase()).copied());
+
+    if let Some(show_id) = existing_show_id {
+        cache.shows.insert(item.id.clone(), show_id);
+        cache.shows_by_title.insert(item.name.trim().to_lowercase(), show_id);
         let rating_id = insert_rating(tx, cache, show_id, "tvshow", item)?;
         let uniqueid_id = insert_uniqueid(tx, cache, show_id, "tvshow", item)?;
         {
@@ -252,6 +264,7 @@ fn insert_series(
     let show_id = cache.next_show;
     cache.next_show += 1;
     cache.shows.insert(item.id.clone(), show_id);
+    cache.shows_by_title.insert(item.name.trim().to_lowercase(), show_id);
     let rating_id = insert_rating(tx, cache, show_id, "tvshow", item)?;
     let uniqueid_id = insert_uniqueid(tx, cache, show_id, "tvshow", item)?;
     {
@@ -289,27 +302,54 @@ fn insert_season(
     let Some(series_id) = &item.series_id else {
         return Ok(());
     };
-    let show_id = match cache.shows.get(series_id) {
-        Some(&id) => id,
+    let show_id = match cache.shows.get(series_id).copied() {
+        Some(id) => id,
         None => {
-            // Placeholder show row if series page not yet seen.
-            let id = cache.next_show;
-            cache.next_show += 1;
-            cache.shows.insert(series_id.clone(), id);
-            {
-                let mut stmt = tx.prepare_cached(
-                    "INSERT INTO tvshow (idShow, c00, c01, c05, c08, c14) VALUES (?1,?2,'','','','')",
-                )?;
-                stmt.execute(params![id, item.series_name.as_deref().unwrap_or("Unknown")])?;
+            // Try matching by series_name before minting a duplicate show row
+            let matched = item.series_name.as_ref().and_then(|name| {
+                cache.shows_by_title.get(&name.trim().to_lowercase()).copied()
+            });
+            if let Some(existing_id) = matched {
+                cache.shows.insert(series_id.clone(), existing_id);
+                existing_id
+            } else {
+                // Placeholder show row if series page not yet seen.
+                let id = cache.next_show;
+                cache.next_show += 1;
+                cache.shows.insert(series_id.clone(), id);
+                if let Some(name) = &item.series_name {
+                    cache.shows_by_title.insert(name.trim().to_lowercase(), id);
+                }
+                {
+                    let mut stmt = tx.prepare_cached(
+                        "INSERT INTO tvshow (idShow, c00, c01, c05, c08, c14) VALUES (?1,?2,'','','','')",
+                    )?;
+                    stmt.execute(params![id, item.series_name.as_deref().unwrap_or("Unknown")])?;
+                }
+                {
+                    let mut stmt = tx.prepare_cached(
+                        "INSERT OR IGNORE INTO tvshowlinkpath (idShow, idPath) VALUES (?1,?2)",
+                    )?;
+                    stmt.execute(params![id, cache.tv_path_id])?;
+                }
+                id
             }
-            id
         }
     };
+
+    // Jellyfin Season: IndexNumber is the season number; ParentIndexNumber is usually None.
+    let num = item.index_number.or(item.parent_index).unwrap_or(0);
+
+    // If season already exists for this show (e.g. from an alternate library version), reuse it
+    if let Some(&existing_season_id) = cache.seasons_by_show_and_num.get(&(show_id, num)) {
+        cache.seasons.insert(item.id.clone(), existing_season_id);
+        return Ok(());
+    }
+
     let season_id = cache.next_season;
     cache.next_season += 1;
     cache.seasons.insert(item.id.clone(), season_id);
-    // Jellyfin Season: IndexNumber is the season number; ParentIndexNumber is usually None.
-    let num = item.index_number.or(item.parent_index).unwrap_or(0);
+    cache.seasons_by_show_and_num.insert((show_id, num), season_id);
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO seasons (idSeason, idShow, season, name) VALUES (?1,?2,?3,?4)",
@@ -350,12 +390,22 @@ fn insert_episode(
     let show_id = item
         .series_id
         .as_ref()
-        .and_then(|s| cache.shows.get(s).copied())
+        .and_then(|s| {
+            cache.shows.get(s).copied().or_else(|| {
+                item.series_name.as_ref().and_then(|name| {
+                    cache.shows_by_title.get(&name.trim().to_lowercase()).copied()
+                })
+            })
+        })
         .unwrap_or(0);
     let season_id = item
         .season_id
         .as_ref()
         .and_then(|s| cache.seasons.get(s).copied())
+        .or_else(|| {
+            let snum = item.parent_index.unwrap_or(0);
+            cache.seasons_by_show_and_num.get(&(show_id, snum)).copied()
+        })
         .unwrap_or(0);
     let duration_str = if duration > 0 { duration.to_string() } else { String::new() };
     let premiered = item.premiered.as_deref().unwrap_or("");
@@ -761,5 +811,169 @@ mod tests {
             .unwrap();
         assert_eq!(a_codec, "truehd");
         assert_eq!(a_channels, 8);
+    }
+
+    #[test]
+    fn series_merging_across_libraries_preserves_all_seasons_and_episodes() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("test_series_merge.db");
+        let mut conn = open_fresh_db(&db_path).unwrap();
+        let mut cache = FkCache::init(&conn).unwrap();
+
+        let cfg = Config::default();
+        let client = JellyfinClient::new(&cfg).unwrap();
+
+        // 1. Pass 1: Series arrives with UHD series ID
+        let series_uhd = JellyfinItem {
+            id: "uhd_series_id".into(),
+            name: "Blackadder".into(),
+            item_type: "Series".into(),
+            overview: Some("Cunning plan".into()),
+            year: Some(1983),
+            premiered: Some("1983-06-15".into()),
+            date_created: None,
+            runtime_ticks: None,
+            mpaa: None,
+            community_rating: None,
+            genres: None,
+            studios: None,
+            people: None,
+            user_data: None,
+            series_id: None,
+            series_name: None,
+            parent_id: None,
+            season_id: None,
+            parent_index: None,
+            index_number: None,
+            provider_ids: None,
+            media_sources: None,
+            media_streams: None,
+            primary_version_id: None,
+        };
+
+        // 2. Pass 2: Season 1 arrives pointing to UHD series ID
+        let season_1 = JellyfinItem {
+            id: "season_1_id".into(),
+            name: "The Black Adder".into(),
+            item_type: "Season".into(),
+            overview: None,
+            year: Some(1983),
+            premiered: None,
+            date_created: None,
+            runtime_ticks: None,
+            mpaa: None,
+            community_rating: None,
+            genres: None,
+            studios: None,
+            people: None,
+            user_data: None,
+            series_id: Some("uhd_series_id".into()),
+            series_name: Some("Blackadder".into()),
+            parent_id: None,
+            season_id: None,
+            parent_index: None,
+            index_number: Some(1),
+            provider_ids: None,
+            media_sources: None,
+            media_streams: None,
+            primary_version_id: None,
+        };
+
+        // Season 4 arrives pointing to HD series ID (alternate library ID suppressed in Pass 1)
+        let season_4 = JellyfinItem {
+            id: "season_4_id".into(),
+            name: "Season 4".into(),
+            item_type: "Season".into(),
+            overview: None,
+            year: Some(1989),
+            premiered: None,
+            date_created: None,
+            runtime_ticks: None,
+            mpaa: None,
+            community_rating: None,
+            genres: None,
+            studios: None,
+            people: None,
+            user_data: None,
+            series_id: Some("hd_series_id".into()),
+            series_name: Some("Blackadder".into()),
+            parent_id: None,
+            season_id: None,
+            parent_index: None,
+            index_number: Some(4),
+            provider_ids: None,
+            media_sources: None,
+            media_streams: None,
+            primary_version_id: None,
+        };
+
+        // 3. Pass 3: Season 4 episode arrives pointing to HD series ID and season_4_id
+        let ep_s4e1 = JellyfinItem {
+            id: "ep_s4e1_id".into(),
+            name: "Captain Cook".into(),
+            item_type: "Episode".into(),
+            overview: Some("Episode plot".into()),
+            year: Some(1989),
+            premiered: Some("1989-09-28".into()),
+            date_created: None,
+            runtime_ticks: Some(1800 * 10_000_000),
+            mpaa: None,
+            community_rating: None,
+            genres: None,
+            studios: None,
+            people: None,
+            user_data: None,
+            series_id: Some("hd_series_id".into()),
+            series_name: Some("Blackadder".into()),
+            parent_id: None,
+            season_id: Some("season_4_id".into()),
+            parent_index: Some(4),
+            index_number: Some(1),
+            provider_ids: None,
+            media_sources: None,
+            media_streams: None,
+            primary_version_id: None,
+        };
+
+        bulk_insert_items(
+            &mut conn,
+            &mut cache,
+            &client,
+            &[series_uhd, season_1, season_4, ep_s4e1],
+            15,
+        )
+        .unwrap();
+
+        // Must create EXACTLY ONE tvshow in Kodi library
+        let show_count: i64 = conn
+            .query_row("SELECT count(*) FROM tvshow", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(show_count, 1, "Must merge into a single tvshow row");
+
+        // Must have BOTH seasons under that single show
+        let season_count: i64 = conn
+            .query_row("SELECT count(*) FROM seasons", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(season_count, 2, "Must contain both Season 1 and Season 4");
+
+        // Episode must be linked to the single show and season 4
+        let (ep_show, ep_season): (i64, i64) = conn
+            .query_row(
+                "SELECT idShow, idSeason FROM episode WHERE c00 = 'Captain Cook'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        let (expected_show, expected_season4): (i64, i64) = conn
+            .query_row(
+                "SELECT idShow, idSeason FROM seasons WHERE season = 4",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(ep_show, expected_show);
+        assert_eq!(ep_season, expected_season4);
     }
 }
