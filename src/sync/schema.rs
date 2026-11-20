@@ -359,19 +359,23 @@ fn insert_episode(
         .unwrap_or(0);
     let duration_str = if duration > 0 { duration.to_string() } else { String::new() };
     let premiered = item.premiered.as_deref().unwrap_or("");
+    let rating_id = insert_rating(tx, cache, ep_id, "episode", item)?;
+    let uniqueid_id = insert_uniqueid(tx, cache, ep_id, "episode", item)?;
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO episode (idEpisode, idFile, c00, c01, c05, c09, c12, c13, idShow, idSeason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            "INSERT INTO episode (idEpisode, idFile, c00, c01, c03, c05, c09, c12, c13, c20, idShow, idSeason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         )?;
         stmt.execute(params![
             ep_id,
             file_id,
             item.name,
             item.overview.as_deref().unwrap_or(""),
+            rating_id.map(|id| id.to_string()).unwrap_or_default(),
             premiered,
             duration_str,
             item.parent_index.unwrap_or(0).to_string(),
             item.index_number.unwrap_or(0).to_string(),
+            uniqueid_id.map(|id| id.to_string()).unwrap_or_default(),
             show_id,
             season_id
         ])?;

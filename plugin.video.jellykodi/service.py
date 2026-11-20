@@ -128,64 +128,127 @@ class UnifiedJellyPlayer(xbmc.Player):
     def __init__(self) -> None:
         super().__init__()
         self.current_pos = 0.0
+        self.duration = 0.0
         self.item_id = ""
         self.media_source_id = ""
         self.play_session_id = ""
 
     def _capture_ids(self) -> None:
         try:
-            pass
+            win = xbmcgui.Window(10000)
+            self.item_id = win.getProperty("jellykodi.item_id")
+            self.media_source_id = win.getProperty("jellykodi.media_source_id")
+            self.play_session_id = win.getProperty("jellykodi.play_session_id")
+            self.duration = float(win.getProperty("jellykodi.duration") or 0.0)
         except Exception:
             pass
 
     def onAVStarted(self) -> None:
         if self.isPlayingVideo():
             self._capture_ids()
+            if self.item_id:
+                try:
+                    self.current_pos = self.getTime()
+                except RuntimeError:
+                    self.current_pos = 0.0
+                notify_daemon(
+                    {
+                        "event": "started",
+                        "file": self.getPlayingFile(),
+                        "item_id": self.item_id,
+                        "media_source_id": self.media_source_id,
+                        "play_session_id": self.play_session_id,
+                        "pos": self.current_pos,
+                        "duration": self.duration,
+                    }
+                )
+
+    def onPlayBackPaused(self) -> None:
+        if self.item_id:
+            try:
+                self.current_pos = self.getTime()
+            except RuntimeError:
+                pass
             notify_daemon(
                 {
-                    "event": "started",
-                    "file": self.getPlayingFile(),
+                    "event": "paused",
                     "item_id": self.item_id,
                     "media_source_id": self.media_source_id,
                     "play_session_id": self.play_session_id,
                     "pos": self.current_pos,
+                    "duration": self.duration,
                 }
             )
 
-    def onPlayBackPaused(self) -> None:
-        notify_daemon(
-            {
-                "event": "paused",
-                "item_id": self.item_id,
-                "media_source_id": self.media_source_id,
-                "play_session_id": self.play_session_id,
-                "pos": self.current_pos,
-            }
-        )
-
     def onPlayBackStopped(self) -> None:
-        notify_daemon(
-            {
-                "event": "stopped",
-                "item_id": self.item_id,
-                "media_source_id": self.media_source_id,
-                "play_session_id": self.play_session_id,
-                "pos": self.current_pos,
-            }
-        )
-        self.item_id = ""
+        if self.item_id:
+            notify_daemon(
+                {
+                    "event": "stopped",
+                    "item_id": self.item_id,
+                    "media_source_id": self.media_source_id,
+                    "play_session_id": self.play_session_id,
+                    "pos": self.current_pos,
+                    "duration": self.duration,
+                }
+            )
+            # Plezy/Findroid architecture: trigger immediate container refresh
+            try:
+                xbmc.executebuiltin("Container.Refresh")
+            except Exception:
+                pass
+            self._clear_session()
 
     def onPlayBackEnded(self) -> None:
-        notify_daemon(
-            {
-                "event": "ended",
-                "item_id": self.item_id,
-                "media_source_id": self.media_source_id,
-                "play_session_id": self.play_session_id,
-                "pos": self.current_pos,
-            }
-        )
+        if self.item_id:
+            notify_daemon(
+                {
+                    "event": "ended",
+                    "item_id": self.item_id,
+                    "media_source_id": self.media_source_id,
+                    "play_session_id": self.play_session_id,
+                    "pos": self.duration if self.duration > 0.0 else self.current_pos,
+                    "duration": self.duration,
+                }
+            )
+            try:
+                xbmc.executebuiltin("Container.Refresh")
+            except Exception:
+                pass
+            self._clear_session()
+
+    def onPlayBackError(self) -> None:
+        if self.item_id:
+            notify_daemon(
+                {
+                    "event": "stopped",
+                    "item_id": self.item_id,
+                    "media_source_id": self.media_source_id,
+                    "play_session_id": self.play_session_id,
+                    "pos": self.current_pos,
+                    "duration": self.duration,
+                }
+            )
+            try:
+                xbmc.executebuiltin("Container.Refresh")
+            except Exception:
+                pass
+            self._clear_session()
+
+    def _clear_session(self) -> None:
         self.item_id = ""
+        self.media_source_id = ""
+        self.play_session_id = ""
+        self.duration = 0.0
+        try:
+            win = xbmcgui.Window(10000)
+            win.clearProperty("jellykodi.item_id")
+            win.clearProperty("jellykodi.media_source_id")
+            win.clearProperty("jellykodi.play_session_id")
+            win.clearProperty("jellykodi.duration")
+            win.clearProperty("jellykodi.stream_url")
+        except Exception:
+            pass
 
 
 def run_service() -> None:
@@ -213,8 +276,10 @@ def run_service() -> None:
     player = UnifiedJellyPlayer()
     monitor = xbmc.Monitor()
     widgets_primed = False
+    _tick = 0
     try:
         while not monitor.abortRequested():
+            _tick += 1
             # After daemon is up: refresh widget cache, then bounce Home once so
             # Arctic right-side rows (hidden while NumItems==0 from boot race)
             # re-query plugin:// paths. Guarded so skin/service restarts do not loop.
@@ -265,7 +330,7 @@ def run_service() -> None:
             if player.isPlayingVideo():
                 try:
                     player.current_pos = player.getTime()
-                    if int(time.time()) % 10 == 0 and player.item_id:
+                    if _tick % 5 == 0 and player.item_id:
                         notify_daemon(
                             {
                                 "event": "progress",
@@ -273,6 +338,7 @@ def run_service() -> None:
                                 "media_source_id": player.media_source_id,
                                 "play_session_id": player.play_session_id,
                                 "pos": player.current_pos,
+                                "duration": player.duration,
                             }
                         )
                 except RuntimeError:

@@ -1,27 +1,94 @@
 use crate::error::{JellyError, Result};
-use crate::jellyfin::types::MediaSource;
+use crate::jellyfin::types::{MediaSource, MediaStream};
 use crate::jellyfin::JellyfinClient;
-use serde::Serialize;
+use crate::widgets::{KodiAudioStream, KodiVideoStream};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KodiSubtitleStream {
+    pub language: String,
+    pub is_default: bool,
+    pub is_forced: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtitleTrackInfo {
+    pub url: String,
+    pub language: String,
+    pub codec: String,
+    pub is_default: bool,
+    pub is_forced: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaybackStreams {
+    pub video: Vec<KodiVideoStream>,
+    pub audio: Vec<KodiAudioStream>,
+    pub subtitle: Vec<KodiSubtitleStream>,
+}
 
 #[derive(Debug, Serialize)]
 pub struct PlayResolve {
     pub stream_url: String,
-    pub subtitles: Vec<String>,
+    pub subtitles: Vec<SubtitleTrackInfo>,
     pub item_id: String,
     pub media_source_id: String,
     pub play_session_id: String,
     pub play_method: String,
+    pub resume_pos_secs: i64,
+    pub duration_secs: i64,
+    pub title: String,
+    pub year: i32,
+    pub plot: String,
+    pub media_type: String,
+    pub streams: PlaybackStreams,
 }
 
 pub async fn resolve_play(client: &JellyfinClient, item_id: &str) -> Result<PlayResolve> {
-    let info = client.playback_info(item_id).await?;
+    let (info_res, item_res) =
+        tokio::join!(client.playback_info(item_id), client.get_item(item_id));
+
+    let info = info_res?;
+    let item = item_res.ok();
+
     let play_session_id = info.play_session_id.unwrap_or_default();
 
     let source = pick_best_source(&info.media_sources)
         .ok_or_else(|| JellyError::Api("PlaybackInfo returned no MediaSources".into()))?;
 
     let (stream_url, play_method) = stream_url_for(client, item_id, source)?;
-    let subtitles = external_subs(client, source);
+    let subtitles = external_subs(client, item_id, source);
+    let streams = extract_playback_streams(source.media_streams.as_deref().unwrap_or(&[]));
+
+    let duration_secs = item
+        .as_ref()
+        .and_then(|i| i.runtime_ticks)
+        .or_else(|| source.media_streams.as_ref().and_then(|ms| {
+            ms.iter()
+                .filter(|m| m.stream_type == "Video")
+                .find_map(|m| m.aspect_ratio.as_ref())
+                .map(|_| 0)
+        }))
+        .unwrap_or(0)
+        / 10_000_000;
+
+    let resume_pos_secs = item
+        .as_ref()
+        .and_then(|i| i.user_data.as_ref())
+        .and_then(|u| u.position_ticks)
+        .unwrap_or(0)
+        / 10_000_000;
+
+    let title = item.as_ref().map(|i| i.name.clone()).unwrap_or_default();
+    let plot = item
+        .as_ref()
+        .and_then(|i| i.overview.clone())
+        .unwrap_or_default();
+    let year = item.as_ref().and_then(|i| i.year).unwrap_or(0);
+    let media_type = item
+        .as_ref()
+        .map(|i| i.item_type.to_ascii_lowercase())
+        .unwrap_or_else(|| "video".into());
 
     Ok(PlayResolve {
         stream_url,
@@ -30,6 +97,13 @@ pub async fn resolve_play(client: &JellyfinClient, item_id: &str) -> Result<Play
         media_source_id: source.id.clone(),
         play_session_id,
         play_method,
+        resume_pos_secs,
+        duration_secs,
+        title,
+        year,
+        plot,
+        media_type,
+        streams,
     })
 }
 
@@ -83,7 +157,11 @@ fn stream_url_for(
     ))
 }
 
-fn external_subs(client: &JellyfinClient, source: &MediaSource) -> Vec<String> {
+fn external_subs(
+    client: &JellyfinClient,
+    item_id: &str,
+    source: &MediaSource,
+) -> Vec<SubtitleTrackInfo> {
     let Some(streams) = &source.media_streams else {
         return vec![];
     };
@@ -91,13 +169,68 @@ fn external_subs(client: &JellyfinClient, source: &MediaSource) -> Vec<String> {
         .iter()
         .filter(|s| {
             s.stream_type == "Subtitle"
-                && s.is_external
-                && s.is_text_subtitle
-                && s.supports_external_stream
+                && (s.is_external || s.supports_external_stream)
         })
-        .filter_map(|s| s.delivery_url.as_ref())
-        .map(|u| absolutize(client.base_url(), u))
+        .map(|s| {
+            let url = if let Some(delivery_url) = &s.delivery_url {
+                absolutize(client.base_url(), delivery_url)
+            } else {
+                let codec = s.codec.as_deref().unwrap_or("srt");
+                format!(
+                    "{}/Videos/{}/{}/Subtitles/{}/Stream.{}?ApiKey={}",
+                    client.base_url().trim_end_matches('/'),
+                    item_id,
+                    source.id,
+                    s.index,
+                    codec,
+                    urlencoding(client.token())
+                )
+            };
+            SubtitleTrackInfo {
+                url,
+                language: s.language.clone().unwrap_or_default(),
+                codec: s.codec.clone().unwrap_or_else(|| "srt".into()),
+                is_default: s.is_default,
+                is_forced: s.is_forced,
+            }
+        })
         .collect()
+}
+
+fn extract_playback_streams(streams: &[MediaStream]) -> PlaybackStreams {
+    let mut video = Vec::new();
+    let mut audio = Vec::new();
+    let mut subtitle = Vec::new();
+
+    for s in streams {
+        if s.stream_type == "Video" {
+            video.push(KodiVideoStream {
+                codec: s.normalized_video_codec(),
+                width: s.width.unwrap_or(0),
+                height: s.height.unwrap_or(0),
+                aspect: s.parsed_aspect_ratio(),
+                hdr_type: s.hdr_type(),
+            });
+        } else if s.stream_type == "Audio" {
+            audio.push(KodiAudioStream {
+                codec: s.normalized_audio_codec(),
+                channels: s.channels.unwrap_or(2),
+                language: s.language.clone().unwrap_or_default(),
+            });
+        } else if s.stream_type == "Subtitle" {
+            subtitle.push(KodiSubtitleStream {
+                language: s.language.clone().unwrap_or_default(),
+                is_default: s.is_default,
+                is_forced: s.is_forced,
+            });
+        }
+    }
+
+    PlaybackStreams {
+        video,
+        audio,
+        subtitle,
+    }
 }
 
 fn absolutize(base: &str, path: &str) -> String {
@@ -112,4 +245,80 @@ fn absolutize(base: &str, path: &str) -> String {
 
 fn urlencoding(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_playback_streams_parses_all_streams() {
+        let streams = vec![
+            MediaStream {
+                stream_type: "Video".into(),
+                index: 0,
+                language: Some("eng".into()),
+                codec: Some("hevc".into()),
+                is_external: false,
+                is_text_subtitle: false,
+                supports_external_stream: false,
+                delivery_url: None,
+                is_default: true,
+                is_forced: false,
+                width: Some(3840),
+                height: Some(2160),
+                channels: None,
+                aspect_ratio: Some("16:9".into()),
+                profile: Some("Main 10".into()),
+                video_range_type: Some("DOVIWithEL".into()),
+                dv_profile: Some(serde_json::json!(7)),
+            },
+            MediaStream {
+                stream_type: "Audio".into(),
+                index: 1,
+                language: Some("eng".into()),
+                codec: Some("truehd".into()),
+                is_external: false,
+                is_text_subtitle: false,
+                supports_external_stream: false,
+                delivery_url: None,
+                is_default: true,
+                is_forced: false,
+                width: None,
+                height: None,
+                channels: Some(8),
+                aspect_ratio: None,
+                profile: None,
+                video_range_type: None,
+                dv_profile: None,
+            },
+            MediaStream {
+                stream_type: "Subtitle".into(),
+                index: 2,
+                language: Some("eng".into()),
+                codec: Some("subrip".into()),
+                is_external: true,
+                is_text_subtitle: true,
+                supports_external_stream: true,
+                delivery_url: Some("/Videos/m1/Subtitles/2/Stream.srt".into()),
+                is_default: false,
+                is_forced: false,
+                width: None,
+                height: None,
+                channels: None,
+                aspect_ratio: None,
+                profile: None,
+                video_range_type: None,
+                dv_profile: None,
+            },
+        ];
+
+        let res = extract_playback_streams(&streams);
+        assert_eq!(res.video.len(), 1);
+        assert_eq!(res.audio.len(), 1);
+        assert_eq!(res.subtitle.len(), 1);
+        assert_eq!(res.video[0].hdr_type, "dolbyvision");
+        assert_eq!(res.audio[0].channels, 8);
+        assert_eq!(res.subtitle[0].language, "eng");
+    }
 }

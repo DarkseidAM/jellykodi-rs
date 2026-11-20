@@ -143,6 +143,11 @@ impl JellyfinClient {
 
     /// Paginated library items (Movie/Series/Season/Episode/BoxSet).
     /// Only page 0 requests `TotalRecordCount` (avoids a full-table COUNT on every page).
+    pub async fn get_item(&self, item_id: &str) -> Result<JellyfinItem> {
+        let q = format!("/Users/{}/Items/{}", self.user_id, item_id);
+        self.get_json(&q).await
+    }
+
     pub async fn items_page(
         &self,
         include_types: &str,
@@ -421,7 +426,9 @@ fn device_profile_coreelec() -> serde_json::Value {
         "MaxStaticBitrate": 200_000_000,
         "MaxStreamingBitrate": 200_000_000,
         "DirectPlayProfiles": [
-            { "Type": "Video", "Container": "mkv,mp4,mov,ts,m2ts,webm", "VideoCodec": "h264,hevc,av1,vp9,mpeg2video,vc1", "AudioCodec": "aac,ac3,eac3,mp3,flac,truehd,dts,dca,opus,pcm,vorbis" }
+            { "Type": "Video", "Container": "mkv,mp4,mov,ts,m2ts,webm,avi,wmv,m4v", "VideoCodec": "h264,hevc,av1,vp9,mpeg2video,vc1,mpeg4", "AudioCodec": "aac,ac3,eac3,mp3,flac,truehd,dts,dca,opus,pcm,vorbis" },
+            { "Type": "Audio" },
+            { "Type": "Photo" }
         ],
         "TranscodingProfiles": [
             { "Type": "Video", "Container": "ts", "VideoCodec": "h264", "AudioCodec": "aac,ac3", "Protocol": "hls", "Context": "Streaming" }
@@ -431,10 +438,22 @@ fn device_profile_coreelec() -> serde_json::Value {
         "SubtitleProfiles": [
             { "Format": "srt", "Method": "External" },
             { "Format": "srt", "Method": "Embed" },
+            { "Format": "subrip", "Method": "Embed" },
+            { "Format": "subrip", "Method": "External" },
+            { "Format": "ass", "Method": "Embed" },
             { "Format": "ass", "Method": "External" },
+            { "Format": "ssa", "Method": "Embed" },
             { "Format": "ssa", "Method": "External" },
+            { "Format": "pgssub", "Method": "Embed" },
+            { "Format": "pgssub", "Method": "External" },
+            { "Format": "pgs", "Method": "Embed" },
+            { "Format": "pgs", "Method": "External" },
+            { "Format": "dvdsub", "Method": "Embed" },
+            { "Format": "dvdsub", "Method": "External" },
+            { "Format": "vtt", "Method": "Embed" },
             { "Format": "vtt", "Method": "External" },
-            { "Format": "subrip", "Method": "External" }
+            { "Format": "sub", "Method": "Embed" },
+            { "Format": "sub", "Method": "External" }
         ]
     })
 }
@@ -442,6 +461,25 @@ fn device_profile_coreelec() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_profile_includes_embedded_subtitles() {
+        let p = device_profile_coreelec();
+        let subs = p["SubtitleProfiles"].as_array().expect("subtitle profiles");
+        let formats: Vec<(String, String)> = subs
+            .iter()
+            .map(|s| {
+                (
+                    s["Format"].as_str().unwrap().to_string(),
+                    s["Method"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert!(formats.contains(&("ass".into(), "Embed".into())));
+        assert!(formats.contains(&("pgssub".into(), "Embed".into())));
+        assert!(formats.contains(&("subrip".into(), "Embed".into())));
+        assert!(formats.contains(&("dvdsub".into(), "Embed".into())));
+    }
 
     #[test]
     fn auth_header_uses_mediabrowser_scheme() {

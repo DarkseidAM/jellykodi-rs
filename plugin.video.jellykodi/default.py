@@ -212,8 +212,66 @@ def render_items(items, content: str = "videos") -> None:
                             pass
             except Exception:
                 pass
+
+            # Rich metadata (Rating, Genres, Studios, MPAA, Cast, UniqueIDs)
+            try:
+                tag = li.getVideoInfoTag()
+                genres = it.get("genres") or []
+                if genres:
+                    tag.setGenres(genres)
+                studios = it.get("studios") or []
+                if studios:
+                    tag.setStudios(studios)
+                mpaa = it.get("mpaa") or ""
+                if mpaa:
+                    tag.setMpaa(mpaa)
+                rating = float(it.get("community_rating") or 0.0)
+                if rating > 0.0:
+                    tag.setRating(rating, 0, "imdb", True)
+                sort_title = it.get("sort_title") or ""
+                if sort_title:
+                    tag.setSortTitle(sort_title)
+                tagline = it.get("tagline") or ""
+                if tagline:
+                    tag.setTagLine(tagline)
+
+                cast_list = it.get("cast") or []
+                if cast_list:
+                    actors = [
+                        xbmc.Actor(
+                            name=c.get("name", ""),
+                            role=c.get("role", ""),
+                            order=int(c.get("order") or 0),
+                            thumbnail=c.get("thumbnail", ""),
+                        )
+                        for c in cast_list
+                        if c.get("name")
+                    ]
+                    tag.setCast(actors)
+            except Exception:
+                pass
+
+            unique_ids = it.get("unique_ids") or {}
+            if unique_ids and isinstance(unique_ids, dict):
+                try:
+                    li.setUniqueIDs(unique_ids, defaultrating="imdb")
+                except Exception:
+                    pass
+
+            if media == "movie" and year > 0:
+                li.setLabel2(str(year))
+            elif media == "episode":
+                s = int(it.get("season") or 0)
+                e = int(it.get("episode") or 0)
+                if s > 0 and e > 0:
+                    li.setLabel2(f"S{s:02d}E{e:02d}")
+
             if is_playable:
                 li.setProperty("IsPlayable", "true")
+            elif is_folder:
+                li.setProperty("IsPlayable", "false")
+                li.setProperty("IsFolder", "true")
+
             dir_items.append((url, li, is_folder))
         except Exception:
             continue
@@ -221,6 +279,10 @@ def render_items(items, content: str = "videos") -> None:
     try:
         if dir_items:
             xbmcplugin.addDirectoryItems(HANDLE, dir_items, len(dir_items))
+        try:
+            xbmcplugin.addSortMethod(HANDLE, xbmcplugin.SORT_METHOD_UNSORTED)
+        except Exception:
+            pass
         # Never cacheToDisc — empty boot listings stick forever.
         xbmcplugin.endOfDirectory(
             HANDLE,
@@ -305,16 +367,110 @@ def resolve_play(item_id: str) -> None:
         xbmcplugin.setResolvedUrl(HANDLE, False, xbmcgui.ListItem())
         return
 
+    resume_pos = int(play.get("resume_pos_secs") or 0)
+    duration = int(play.get("duration_secs") or 0)
+    start_offset = 0
+
+    # C MODE: Native Kodi Library click (videodb://) - Kodi handles bookmark dialog and sets sys.argv[3]
+    if len(sys.argv) > 3 and "resume:" in sys.argv[3]:
+        is_resume = sys.argv[3].split("resume:")[1].lower() == "true"
+        start_offset = resume_pos if is_resume else 0
+    # A MODE: Direct Jellyfin widget click (plugin://) - Context Menu Dialog
+    elif resume_pos > 0 and duration > resume_pos:
+        mins, secs = divmod(resume_pos, 60)
+        hours, mins = divmod(mins, 60)
+        time_str = f"{hours}:{mins:02d}:{secs:02d}" if hours else f"{mins}:{secs:02d}"
+        choice = xbmcgui.Dialog().contextmenu([f"Resume from {time_str}", "Play from beginning"])
+        if choice == -1:  # Cancelled / Back
+            xbmcplugin.setResolvedUrl(HANDLE, False, xbmcgui.ListItem())
+            return
+        start_offset = resume_pos if choice == 0 else 0
+
     li = xbmcgui.ListItem(path=play["stream_url"], offscreen=True)
-    subs = play.get("subtitles") or []
+    li.setProperty("IsPlayable", "true")
+    li.setProperty("StartOffset", str(start_offset))
+
+    # Video Info Tag on resolved ListItem for OSD display
+    try:
+        tag = li.getVideoInfoTag()
+        tag.setTitle(play.get("title") or "")
+        tag.setMediaType(play.get("media_type") or "video")
+        if play.get("plot"):
+            tag.setPlot(play["plot"])
+        if play.get("year"):
+            tag.setYear(int(play["year"]))
+        if duration > 0:
+            tag.setDuration(duration)
+        if resume_pos > 0:
+            tag.setResumePoint(float(resume_pos), float(duration))
+    except Exception:
+        pass
+
+    # Add stream tracks for Player OSD Track Selector
+    streams = play.get("streams") or {}
+    if isinstance(streams, dict):
+        for vt in streams.get("video") or []:
+            try:
+                li.addStreamInfo(
+                    "video",
+                    {
+                        "codec": vt.get("codec", ""),
+                        "width": int(vt.get("width") or 0),
+                        "height": int(vt.get("height") or 0),
+                        "aspect": float(vt.get("aspect") or 1.78),
+                        "duration": duration,
+                        "hdrtype": vt.get("hdr_type", ""),
+                    },
+                )
+            except Exception:
+                pass
+        for at in streams.get("audio") or []:
+            try:
+                li.addStreamInfo(
+                    "audio",
+                    {
+                        "codec": at.get("codec", ""),
+                        "channels": int(at.get("channels") or 2),
+                        "language": at.get("language", ""),
+                    },
+                )
+            except Exception:
+                pass
+        for st in streams.get("subtitle") or []:
+            try:
+                li.addStreamInfo(
+                    "subtitle",
+                    {
+                        "language": st.get("language", ""),
+                    },
+                )
+            except Exception:
+                pass
+
+    # External Subtitles (Option 1: direct URL streaming)
+    subs = []
+    for s in play.get("subtitles") or []:
+        if isinstance(s, dict) and s.get("url"):
+            subs.append(s["url"])
+        elif isinstance(s, str) and s:
+            subs.append(s)
     if subs:
         try:
             li.setSubtitles(subs)
         except Exception:
             pass
-    li.setProperty("jellykodi.item_id", play.get("item_id") or item_id)
-    li.setProperty("jellykodi.media_source_id", play.get("media_source_id") or "")
-    li.setProperty("jellykodi.play_session_id", play.get("play_session_id") or "")
+
+    # Bridge session tracking to service.py via HomeWindow
+    try:
+        win = xbmcgui.Window(10000)
+        win.setProperty("jellykodi.item_id", play.get("item_id") or item_id)
+        win.setProperty("jellykodi.media_source_id", play.get("media_source_id") or "")
+        win.setProperty("jellykodi.play_session_id", play.get("play_session_id") or "")
+        win.setProperty("jellykodi.stream_url", play["stream_url"])
+        win.setProperty("jellykodi.duration", str(duration))
+    except Exception:
+        pass
+
     xbmcplugin.setResolvedUrl(HANDLE, True, li)
 
 

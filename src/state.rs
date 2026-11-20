@@ -66,4 +66,71 @@ impl AppState {
             library_items: *self.library_items.read().await,
         }
     }
+
+    /// Optimistic in-memory update for continue_watching & resume widgets on playback stop.
+    /// Eliminates network delay so home widgets are already refreshed when the user returns.
+    pub async fn optimistic_update_cw(&self, item_id: &str, pos_secs: f64, duration_secs: f64) {
+        if item_id.is_empty() {
+            return;
+        }
+        let mut map = self.widgets.write().await;
+        for key in &["continue_watching", "resume"] {
+            if let Some(cw_val) = map.get_mut(*key)
+                && let Some(arr) = cw_val.as_array_mut()
+                && let Some(idx) = arr.iter().position(|it| {
+                    it.get("plugin_url")
+                        .and_then(|u| u.as_str())
+                        .map(|u| u.contains(item_id))
+                        .unwrap_or(false)
+                })
+            {
+                let mut item = arr.remove(idx);
+                let played = duration_secs > 0.0 && (pos_secs / duration_secs) >= 0.90;
+                if !played && pos_secs > 10.0 {
+                    if let Some(obj) = item.as_object_mut() {
+                        obj.insert("resume_pos".into(), serde_json::json!(pos_secs as i64));
+                    }
+                    arr.insert(0, item);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn optimistic_update_cw_updates_and_moves_to_front() {
+        let state = AppState::new();
+        let items = serde_json::json!([
+            { "title": "Show A", "plugin_url": "plugin://plugin.video.jellykodi/?mode=play&id=id1", "resume_pos": 100 },
+            { "title": "Show B", "plugin_url": "plugin://plugin.video.jellykodi/?mode=play&id=id2", "resume_pos": 50 }
+        ]);
+        state.widgets.write().await.insert("continue_watching".into(), items);
+
+        state.optimistic_update_cw("id2", 500.0, 1800.0).await;
+
+        let map = state.widgets.read().await;
+        let cw = map.get("continue_watching").unwrap().as_array().unwrap();
+        assert_eq!(cw[0]["title"], "Show B");
+        assert_eq!(cw[0]["resume_pos"], 500);
+        assert_eq!(cw[1]["title"], "Show A");
+    }
+
+    #[tokio::test]
+    async fn optimistic_update_cw_removes_played() {
+        let state = AppState::new();
+        let items = serde_json::json!([
+            { "title": "Show A", "plugin_url": "plugin://plugin.video.jellykodi/?mode=play&id=id1", "resume_pos": 100 }
+        ]);
+        state.widgets.write().await.insert("continue_watching".into(), items);
+
+        state.optimistic_update_cw("id1", 1750.0, 1800.0).await;
+
+        let map = state.widgets.read().await;
+        let cw = map.get("continue_watching").unwrap().as_array().unwrap();
+        assert_eq!(cw.len(), 0);
+    }
 }

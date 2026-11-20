@@ -69,6 +69,8 @@ pub struct Named {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Person {
+    #[serde(rename = "Id")]
+    pub id: Option<String>,
     #[serde(rename = "Name")]
     pub name: String,
     #[serde(rename = "Role")]

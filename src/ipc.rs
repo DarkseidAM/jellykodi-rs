@@ -130,6 +130,7 @@ async fn handle_event(
         .unwrap_or("")
         .to_string();
     let pos = v.get("pos").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let duration = v.get("duration").and_then(|x| x.as_f64()).unwrap_or(0.0);
     let position_ticks = (pos * 10_000_000.0) as i64;
 
     match event {
@@ -158,12 +159,22 @@ async fn handle_event(
         "stopped" | "ended" => {
             state.set_playing(false);
             if !item_id.is_empty() {
-                let _ = client
-                    .reporting_stopped(&item_id, &media_source_id, &play_session_id, position_ticks)
-                    .await;
+                // 1. Instant optimistic in-memory update (<0.1ms) - Plezy/Findroid architecture
+                state.optimistic_update_cw(&item_id, pos, duration).await;
+
+                // 2. Background authoritative reporting and widget refresh
+                let c = client.clone();
+                let s = Arc::clone(state);
+                let iid = item_id.clone();
+                let msid = media_source_id.clone();
+                let psid = play_session_id.clone();
+                tokio::spawn(async move {
+                    let _ = c
+                        .reporting_stopped(&iid, &msid, &psid, position_ticks)
+                        .await;
+                    let _ = widgets::refresh_all_widgets(&c, &s).await;
+                });
             }
-            // Refresh CW after stop so home widgets stay live.
-            let _ = widgets::refresh_all_widgets(client, state).await;
         }
         _ => {}
     }

@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::info;
 
-const WIDGET_FIELDS: &str = "PrimaryImageAspectRatio,DateCreated,Overview,PremiereDate,ProductionYear,RunTimeTicks,UserData,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,MediaStreams";
+const WIDGET_FIELDS: &str = "PrimaryImageAspectRatio,DateCreated,Overview,PremiereDate,ProductionYear,RunTimeTicks,UserData,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,MediaStreams,Genres,Studios,People,OfficialRating,CommunityRating,ProviderIds,Taglines,SortName";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KodiStreamDetails {
@@ -32,7 +32,15 @@ pub struct KodiAudioStream {
     pub language: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KodiCastMember {
+    pub name: String,
+    pub role: String,
+    pub order: i32,
+    pub thumbnail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KodiWidgetItem {
     pub title: String,
     pub plot: String,
@@ -46,9 +54,21 @@ pub struct KodiWidgetItem {
     pub sort_ts: String,
     pub art: KodiArt,
     pub streams: Option<KodiStreamDetails>,
+    pub genres: Vec<String>,
+    pub studios: Vec<String>,
+    pub mpaa: String,
+    pub community_rating: f64,
+    pub sort_title: String,
+    pub tagline: String,
+    pub cast: Vec<KodiCastMember>,
+    pub unique_ids: std::collections::HashMap<String, String>,
+    pub season: Option<i32>,
+    pub episode: Option<i32>,
+    pub series_id: Option<String>,
+    pub series_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KodiArt {
     pub poster: String,
     pub fanart: String,
@@ -289,6 +309,45 @@ fn to_widget(client: &JellyfinClient, raw: &JellyfinItem) -> KodiWidgetItem {
     let is_folder = matches!(raw.item_type.as_str(), "Series" | "BoxSet" | "Season" | "Folder");
     let is_playable = !is_folder && matches!(raw.item_type.as_str(), "Movie" | "Episode");
     let streams = raw.media_streams.as_deref().and_then(extract_stream_details);
+
+    let genres = raw.genres.clone().unwrap_or_default();
+    let studios = raw
+        .studios
+        .as_ref()
+        .map(|sts| sts.iter().map(|s| s.name.clone()).collect())
+        .unwrap_or_default();
+    let mpaa = raw.mpaa.clone().unwrap_or_default();
+    let community_rating = raw.community_rating.unwrap_or(0.0);
+    let sort_title = raw.name.clone();
+    let tagline = String::new();
+
+    let mut cast = Vec::new();
+    if let Some(people) = &raw.people {
+        for (idx, p) in people.iter().take(15).enumerate() {
+            cast.push(KodiCastMember {
+                name: p.name.clone(),
+                role: p.role.clone().unwrap_or_default(),
+                order: idx as i32,
+                thumbnail: p
+                    .id
+                    .as_deref()
+                    .map(|id| client.image_url(id, "Primary", 300))
+                    .unwrap_or_default(),
+            });
+        }
+    }
+
+    let mut unique_ids = std::collections::HashMap::new();
+    if let Some(ids) = &raw.provider_ids
+        && let Some(obj) = ids.as_object()
+    {
+        for (k, v) in obj {
+            if let Some(val_str) = v.as_str() {
+                unique_ids.insert(k.to_ascii_lowercase(), val_str.to_string());
+            }
+        }
+    }
+
     KodiWidgetItem {
         title,
         plot: raw.overview.clone().unwrap_or_default(),
@@ -317,6 +376,18 @@ fn to_widget(client: &JellyfinClient, raw: &JellyfinItem) -> KodiWidgetItem {
             thumb: client.image_url(&raw.id, "Primary", 640),
         },
         streams,
+        genres,
+        studios,
+        mpaa,
+        community_rating,
+        sort_title,
+        tagline,
+        cast,
+        unique_ids,
+        season: raw.parent_index,
+        episode: raw.index_number,
+        series_id: raw.series_id.clone(),
+        series_name: raw.series_name.clone(),
     }
 }
 
