@@ -137,6 +137,28 @@ pub async fn refresh_all_widgets(client: &JellyfinClient, state: &Arc<AppState>)
     map.insert("favorites".into(), fav_all_v);
     map.insert("resume".into(), cw_v);
 
+    let (random_movies, random_shows, recs, unplayed, people) = tokio::try_join!(
+        refresh_filtered(client, "Movie", "", "Random", "Ascending", "movie"),
+        refresh_filtered(client, "Series", "", "Random", "Ascending", "tvshow"),
+        refresh_filtered(client, "Movie", "", "Random", "Ascending", "movie"),
+        refresh_filtered(client, "Movie", "IsUnplayed", "DateCreated", "Descending", "movie"),
+        refresh_people(client),
+    )?;
+    let mut random_all = random_movies.clone();
+    random_all.extend(random_shows.iter().cloned());
+    let mut recent_all = movies.clone();
+    recent_all.extend(episodes.iter().cloned());
+    recent_all.sort_by(|a, b| b.sort_ts.cmp(&a.sort_ts));
+    recent_all.truncate(20);
+
+    map.insert("random_movies".into(), serde_json::to_value(&random_movies)?);
+    map.insert("random_tvshows".into(), serde_json::to_value(&random_shows)?);
+    map.insert("random_all".into(), serde_json::to_value(&random_all)?);
+    map.insert("recent_all".into(), serde_json::to_value(&recent_all)?);
+    map.insert("movie_recommendations".into(), serde_json::to_value(&recs)?);
+    map.insert("unplayed_movies".into(), serde_json::to_value(&unplayed)?);
+    map.insert("cast".into(), serde_json::to_value(&people)?);
+
     info!(
         "widgets refreshed cw={} in_prog_m={} in_prog_e={} nextup={} movies={} episodes={} fav_m={} fav_s={} coll={} fav_coll={}",
         cw.len(),
@@ -246,12 +268,88 @@ async fn refresh_filtered(
 
 pub async fn search_items(
     client: &JellyfinClient,
+    state: &Arc<AppState>,
     term: &str,
 ) -> Result<Vec<KodiWidgetItem>> {
+    if let Some(paths) = state.library_paths.read().await.clone() {
+        let term_owned = term.to_string();
+        let hits = tokio::task::spawn_blocking(move || {
+            let videos = crate::sync::find_or_create_myvideos_path(&paths.kodi_db_dir)?;
+            crate::sync::schema::search_local(&videos, &paths.map_db_path, &term_owned, 40)
+        })
+        .await
+        .map_err(|e| crate::error::JellyError::Other(format!("search join: {e}")))??;
+        if !hits.is_empty() {
+            return Ok(hits.into_iter().map(|h| local_to_widget(client, h)).collect());
+        }
+    }
     let env = client
-        .search(term, "Movie,Series,Episode", 40, WIDGET_FIELDS)
+        .search(term, "Movie,Series,Episode", 40, "Overview,ProductionYear,UserData,SeriesName,ParentIndexNumber,IndexNumber")
         .await?;
     Ok(env.items.into_iter().map(|it| to_widget(client, &it)).collect())
+}
+
+fn local_to_widget(client: &JellyfinClient, hit: crate::sync::schema::LocalHit) -> KodiWidgetItem {
+    let folder = hit.kind == "tvshow";
+    let playable = hit.kind == "movie" || hit.kind == "episode";
+    let url = if playable {
+        format!("plugin://plugin.video.jellykodi/?mode=play&id={}", hit.jellyfin_id)
+    } else if hit.kind == "tvshow" {
+        format!("plugin://plugin.video.jellykodi/?mode=browse&id={}", hit.jellyfin_id)
+    } else {
+        format!(
+            "plugin://plugin.video.jellykodi/?mode=search&q={}",
+            urlencoding_min(&hit.title)
+        )
+    };
+    KodiWidgetItem {
+        title: hit.title,
+        plot: hit.plot,
+        year: hit.year,
+        duration: 0,
+        resume_pos: 0,
+        media_type: match hit.kind.as_str() {
+            "episode" => "episode".into(),
+            "tvshow" => "tvshow".into(),
+            _ => "movie".into(),
+        },
+        plugin_url: url,
+        is_folder: folder,
+        is_playable: playable,
+        sort_ts: String::new(),
+        art: KodiArt {
+            poster: client.image_url(&hit.jellyfin_id, "Primary", 600),
+            fanart: client.image_url(&hit.jellyfin_id, "Backdrop", 1280),
+            thumb: client.image_url(&hit.jellyfin_id, "Primary", 640),
+        },
+        streams: None,
+        genres: Vec::new(),
+        studios: Vec::new(),
+        mpaa: String::new(),
+        community_rating: 0.0,
+        sort_title: String::new(),
+        tagline: String::new(),
+        cast: Vec::new(),
+        unique_ids: std::collections::HashMap::new(),
+        season: None,
+        episode: None,
+        series_id: None,
+        series_name: None,
+    }
+}
+
+fn urlencoding_min(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+async fn refresh_people(client: &JellyfinClient) -> Result<Vec<KodiWidgetItem>> {
+    match client.persons(20).await {
+        Ok(env) => Ok(env.items.into_iter().map(|it| to_widget(client, &it)).collect()),
+        Err(e) => {
+            tracing::warn!("people widget skipped: {e}");
+            Ok(Vec::new())
+        }
+    }
 }
 
 /// Expand a BoxSet / Series / Season into playable (or nested folder) children.
@@ -306,7 +404,9 @@ fn to_widget(client: &JellyfinClient, raw: &JellyfinItem) -> KodiWidgetItem {
         .or_else(|| raw.date_created.clone())
         .unwrap_or_default();
     let poster_id = raw.series_id.as_deref().unwrap_or(&raw.id);
-    let is_folder = matches!(raw.item_type.as_str(), "Series" | "BoxSet" | "Season" | "Folder");
+    let is_person = raw.item_type == "Person";
+    let is_folder = is_person
+        || matches!(raw.item_type.as_str(), "Series" | "BoxSet" | "Season" | "Folder");
     let is_playable = !is_folder && matches!(raw.item_type.as_str(), "Movie" | "Episode");
     let streams = raw.media_streams.as_deref().and_then(extract_stream_details);
 
@@ -359,10 +459,15 @@ fn to_widget(client: &JellyfinClient, raw: &JellyfinItem) -> KodiWidgetItem {
             "Series" => "tvshow".into(),
             "Season" => "season".into(),
             "BoxSet" => "set".into(),
+            "Person" => "video".into(),
             _ => "movie".into(),
         },
-        // Folders must stay inside the plugin — videodb:// sets/titles are empty (no idSet links yet).
-        plugin_url: if is_playable {
+        plugin_url: if is_person {
+            format!(
+                "plugin://plugin.video.jellykodi/?mode=search&q={}",
+                urlencoding_min(&raw.name)
+            )
+        } else if is_playable {
             format!("plugin://plugin.video.jellykodi/?mode=play&id={}", raw.id)
         } else {
             format!("plugin://plugin.video.jellykodi/?mode=browse&id={}", raw.id)
@@ -481,6 +586,7 @@ mod tests {
             media_sources: None,
             media_streams: None,
             primary_version_id: None,
+            ..Default::default()
         };
     }
 

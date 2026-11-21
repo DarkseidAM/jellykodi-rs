@@ -8,7 +8,7 @@ pub struct ItemsEnvelope {
     pub total_record_count: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct JellyfinItem {
     #[serde(rename = "Id")]
     pub id: String,
@@ -59,6 +59,30 @@ pub struct JellyfinItem {
     /// Primary version id when this item is an alternate (Merge Versions).
     #[serde(rename = "PrimaryVersionId")]
     pub primary_version_id: Option<String>,
+    #[serde(default, rename = "Tagline")]
+    pub tagline: Option<String>,
+    #[serde(default, rename = "Tags")]
+    pub tags: Option<Vec<String>>,
+    #[serde(default, rename = "ProductionLocations")]
+    pub production_locations: Option<Vec<String>>,
+    #[serde(default, rename = "RemoteTrailers")]
+    pub remote_trailers: Option<Vec<RemoteTrailer>>,
+    #[serde(default, rename = "SortName")]
+    pub sort_name: Option<String>,
+    #[serde(default, rename = "Status")]
+    pub status: Option<String>,
+    #[serde(default, rename = "ImageTags")]
+    pub image_tags: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, rename = "BackdropImageTags")]
+    pub backdrop_image_tags: Option<Vec<String>>,
+    #[serde(default, rename = "VoteCount")]
+    pub vote_count: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RemoteTrailer {
+    #[serde(rename = "Url")]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

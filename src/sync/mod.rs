@@ -9,7 +9,8 @@ use crate::widgets;
 use chrono::Utc;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use schema::{
-    bulk_insert_items, finalize_staging_db, open_fresh_db, swap_into_place, FkCache, MapDb,
+    apply_playback, bulk_insert_items, delete_mapped, finalize_staging_db, insert_live_items,
+    open_fresh_db, swap_into_place, FkCache, MapDb,
 };
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -19,7 +20,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 /// Full metadata for movies / series / boxsets (People joins are expensive on episodes).
-const SYNC_FIELDS_FULL: &str = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Genres,Studios,People,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear,MediaStreams";
+const SYNC_FIELDS_FULL: &str = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Genres,Studios,People,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear,MediaStreams,Tagline,Tags,ProductionLocations,RemoteTrailers,SortName,Status,ImageTags,BackdropImageTags,VoteCount";
 
 /// Lean fields for Season/Episode — no People/Studios/Genres (huge JF JOIN cost).
 const SYNC_FIELDS_LEAN: &str = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear,MediaStreams";
@@ -143,28 +144,32 @@ async fn full_sync_inner(
         cache,
     })
     .await?;
-    // Pass 3: episodes (lean, no cast) — cache.seasons populated from pass 2.
+    // Pass 3: episodes with the same fields and cast budget as movies.
     let (mut conn, cache, n3) = sync_pass(SyncPass {
         client,
         cfg,
         concurrency,
         include_types: "Episode",
-        fields: SYNC_FIELDS_LEAN,
-        cast_limit: 0,
+        fields: SYNC_FIELDS_FULL,
+        cast_limit: cfg.cast_limit,
         pass_name: "episodes",
         conn,
         cache,
     })
     .await?;
 
+    link_boxset_membership(client, &mut conn, &cache).await?;
+    let map_rows = {
+        let mut cache = cache;
+        cache.take_map()
+    };
     let total_seen = n1 + n2 + n3;
-    drop(cache);
     finalize_staging_db(&mut conn)?;
     drop(conn);
 
     let target = find_or_create_myvideos_path(&cfg.kodi_db_dir)?;
     swap_into_place(&staging, &target)?;
-    MapDb::rebuild_from_pass(&cfg.map_db_path, total_seen)?;
+    MapDb::rebuild_from_pass(&cfg.map_db_path, total_seen, &map_rows)?;
     *state.library_items.write().await = total_seen;
     *state.last_full_sync.write().await = Some(Utc::now().to_rfc3339());
     *state.last_error.write().await = None;
@@ -320,12 +325,35 @@ async fn sync_pass(
     Ok((conn, cache, written))
 }
 
-/// Skip alternate versions that point at a PrimaryVersionId (one card per title).
+/// Keep alternate movie files (stored as extra videoversions). Drop alternate
+/// episodes so a title does not appear twice in a season.
 fn filter_primary_versions(items: Vec<JellyfinItem>) -> Vec<JellyfinItem> {
     items
         .into_iter()
-        .filter(|it| !matches!(&it.primary_version_id, Some(pid) if pid != &it.id))
+        .filter(|it| {
+            let alternate = matches!(&it.primary_version_id, Some(pid) if pid != &it.id);
+            !(alternate && it.item_type == "Episode")
+        })
         .collect()
+}
+
+async fn link_boxset_membership(
+    client: &JellyfinClient,
+    conn: &mut rusqlite::Connection,
+    cache: &FkCache,
+) -> Result<()> {
+    use crate::sync::schema::set_movie_collection;
+    for (boxset_id, set_id) in cache.boxset_pairs() {
+        let page = client
+            .items_by_parent(&boxset_id, "Movie", 300, "Name")
+            .await?;
+        for movie in page.items {
+            if let Some(movie_id) = cache.movie_id(&movie.id) {
+                set_movie_collection(conn, movie_id, set_id)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn delta_sync(
@@ -357,9 +385,9 @@ async fn delta_sync(
                 resp.items.len()
             );
             if !resp.items.is_empty() {
+                apply_kodisync(client, cfg, &resp.items).await?;
                 let _ = widgets::refresh_all_widgets(client, state).await;
             }
-            let _ = cfg;
             Ok(())
         }
         Err(e) => {
@@ -369,7 +397,80 @@ async fn delta_sync(
     }
 }
 
-fn find_or_create_myvideos_path(db_dir: &PathBuf) -> Result<PathBuf> {
+async fn apply_kodisync(
+    client: &JellyfinClient,
+    cfg: &Config,
+    items: &[crate::jellyfin::types::KodiSyncQueueItem],
+) -> Result<()> {
+    let videos = find_or_create_myvideos_path(&cfg.kodi_db_dir)?;
+    let map_path = cfg.map_db_path.clone();
+    let mut to_insert = Vec::new();
+    for it in items {
+        let Some(id) = it.item_id.as_deref() else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        match it.change_type.as_deref() {
+            Some("Removed") => {
+                let videos = videos.clone();
+                let map_path = map_path.clone();
+                let id = id.to_string();
+                tokio::task::spawn_blocking(move || delete_mapped(&videos, &map_path, &id))
+                    .await
+                    .map_err(|e| JellyError::Other(format!("delete join: {e}")))??;
+            }
+            _ => {
+                let item = match client.get_item(id).await {
+                    Ok(item) => item,
+                    Err(e) => {
+                        warn!("delta get_item {id} failed: {e}");
+                        continue;
+                    }
+                };
+                let videos_pb = videos.clone();
+                let map_pb = map_path.clone();
+                let id_owned = id.to_string();
+                let (pos, dur) = playback_secs(&item);
+                let known = MapDb::lookup(&map_path, id).unwrap_or(None).is_some();
+                tokio::task::spawn_blocking(move || {
+                    apply_playback(&videos_pb, &map_pb, &id_owned, pos, dur)
+                })
+                .await
+                .map_err(|e| JellyError::Other(format!("userdata join: {e}")))??;
+                let kind = item.item_type.as_str();
+                let keep = matches!(kind, "Movie" | "Series" | "Season" | "Episode" | "BoxSet");
+                if !known && keep && it.change_type.as_deref() != Some("Removed") {
+                    to_insert.push(item);
+                }
+            }
+        }
+    }
+    if !to_insert.is_empty() {
+        let client_db = client.clone();
+        let cast_limit = cfg.cast_limit;
+        tokio::task::spawn_blocking(move || {
+            insert_live_items(&videos, &map_path, &client_db, &to_insert, cast_limit)
+        })
+        .await
+        .map_err(|e| JellyError::Other(format!("insert join: {e}")))??;
+    }
+    Ok(())
+}
+
+fn playback_secs(item: &JellyfinItem) -> (f64, f64) {
+    let pos = item
+        .user_data
+        .as_ref()
+        .and_then(|u| u.position_ticks)
+        .unwrap_or(0) as f64
+        / 10_000_000.0;
+    let dur = item.runtime_ticks.unwrap_or(0) as f64 / 10_000_000.0;
+    (pos, dur)
+}
+
+pub fn find_or_create_myvideos_path(db_dir: &PathBuf) -> Result<PathBuf> {
     std::fs::create_dir_all(db_dir)?;
     let mut candidates: Vec<_> = std::fs::read_dir(db_dir)?
         .filter_map(|e| e.ok())

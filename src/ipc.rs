@@ -70,7 +70,7 @@ async fn dispatch(
         return Ok(widgets::widget_payload(state, name.trim()).await);
     }
     if let Some(term) = line.strip_prefix("SEARCH ") {
-        let items = widgets::search_items(client, term.trim()).await?;
+        let items = widgets::search_items(client, state, term.trim()).await?;
         return Ok(serde_json::to_value(items)?);
     }
     if let Some(id) = line.strip_prefix("BROWSE ") {
@@ -99,6 +99,24 @@ async fn dispatch(
     if line == "RESYNC" {
         state.resync_notify.notify_one();
         return Ok(json!({"queued": true}));
+    }
+    if let Some(rest) = line.strip_prefix("NEXT ") {
+        let mut parts = rest.split_whitespace();
+        let item_id = parts.next().unwrap_or("");
+        let series_id = parts.next().unwrap_or("");
+        let next = client.adjacent_next(series_id, item_id).await?;
+        return Ok(json!({
+            "id": next.as_ref().map(|it| it.id.clone()),
+            "title": next.as_ref().map(|it| it.name.clone()),
+        }));
+    }
+    if let Some(id) = line.strip_prefix("PLAYED ") {
+        client.mark_played(id.trim()).await?;
+        return Ok(json!({"ok": true}));
+    }
+    if let Some(id) = line.strip_prefix("FAVORITE ") {
+        client.mark_favorite(id.trim()).await?;
+        return Ok(json!({"ok": true}));
     }
     if line == "REFRESH_WIDGETS" {
         widgets::refresh_all_widgets(client, state).await?;
@@ -180,6 +198,29 @@ async fn handle_event(
                         warn!("reporting_stopped failed for {iid}: {e}");
                     } else {
                         info!("reporting_stopped confirmed for {iid} at {position_ticks} ticks ({pos:.1}s)");
+                    }
+                    if let Some(paths) = s.library_paths.read().await.clone() {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let videos = match crate::sync::find_or_create_myvideos_path(
+                                &paths.kodi_db_dir,
+                            ) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    warn!("myvideos path: {e}");
+                                    return;
+                                }
+                            };
+                            if let Err(e) = crate::sync::schema::apply_playback(
+                                &videos,
+                                &paths.map_db_path,
+                                &iid,
+                                pos,
+                                duration,
+                            ) {
+                                warn!("local playback update failed: {e}");
+                            }
+                        })
+                        .await;
                     }
                     let _ = widgets::refresh_all_widgets(&c, &s).await;
                 });

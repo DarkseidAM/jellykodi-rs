@@ -1,8 +1,15 @@
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
+
+#[derive(Debug, Clone, Default)]
+pub struct LibraryPaths {
+    pub kodi_db_dir: PathBuf,
+    pub map_db_path: PathBuf,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct StatusSnapshot {
@@ -24,6 +31,7 @@ pub struct AppState {
     pub widgets: RwLock<HashMap<String, Value>>,
     pub resync_notify: Notify,
     pub delta_notify: Notify,
+    pub library_paths: RwLock<Option<LibraryPaths>>,
 }
 
 impl AppState {
@@ -38,6 +46,7 @@ impl AppState {
             widgets: RwLock::new(HashMap::new()),
             resync_notify: Notify::new(),
             delta_notify: Notify::new(),
+            library_paths: RwLock::new(None),
         })
     }
 

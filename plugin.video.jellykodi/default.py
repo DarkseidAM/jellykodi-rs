@@ -345,6 +345,8 @@ def resolve_play(item_id: str) -> None:
         start_offset = resume_pos
         xbmc.log(f"[jellykodi] resolve_play explicit resume:true -> start_offset={start_offset}", xbmc.LOGINFO)
     # Otherwise, for widget clicks (where Kodi passes resume:false by default without prompting), prompt the user:
+    elif resume_pos > 0 and ADDON.getSetting("resume_prompt") == "false":
+        start_offset = resume_pos
     elif resume_pos > 0:
         mins, secs = divmod(resume_pos, 60)
         hours, mins = divmod(mins, 60)
@@ -456,6 +458,9 @@ def resolve_play(item_id: str) -> None:
         win.setProperty("jellykodi.stream_url", play["stream_url"])
         win.setProperty("jellykodi.duration", str(duration))
         win.setProperty("jellykodi.start_offset", str(start_offset))
+        win.setProperty("jellykodi.intro_start", str(play.get("intro_start_secs") or 0))
+        win.setProperty("jellykodi.intro_end", str(play.get("intro_end_secs") or 0))
+        win.setProperty("jellykodi.series_id", play.get("series_id") or "")
     except Exception:
         pass
 
@@ -482,6 +487,49 @@ def run_search(query: str = "") -> None:
     render_items(items, content="videos")
 
 
+def _notify_action(command: str, ok_text: str) -> None:
+    try:
+        ipc_call(command, timeout=30.0, wait_daemon=5.0)
+        xbmcgui.Dialog().notification("JellyKodi", ok_text, xbmcgui.NOTIFICATION_INFO, 3000)
+    except Exception as exc:
+        try:
+            xbmcgui.Dialog().notification("JellyKodi", str(exc), xbmcgui.NOTIFICATION_ERROR, 4000)
+        except Exception:
+            pass
+    try:
+        xbmcplugin.endOfDirectory(HANDLE)
+    except Exception:
+        pass
+
+
+def _apply_server_settings() -> None:
+    path = os.path.join(addon_data_path(), "config.json")
+    os.makedirs(addon_data_path(), exist_ok=True)
+    cfg = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except Exception:
+            cfg = {}
+    addon = xbmcaddon.Addon()
+    server = addon.getSetting("server_url") or "https://jellyfin.darkseid.in"
+    cfg["server_url"] = server.rstrip("/")
+    cfg["user_id"] = addon.getSetting("user_id") or ""
+    cfg["access_token"] = addon.getSetting("access_token") or ""
+    cfg["device_id"] = addon.getSetting("device_id") or "jellykodi-coreelec"
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2)
+    open(os.path.join(addon_data_path(), ".restart_daemon"), "w").close()
+    xbmcgui.Dialog().notification(
+        "JellyKodi", "Server settings saved", xbmcgui.NOTIFICATION_INFO, 3000
+    )
+    try:
+        xbmcplugin.endOfDirectory(HANDLE)
+    except Exception:
+        pass
+
+
 def main() -> None:
     params = dict(parse_qsl(sys.argv[2].lstrip("?"))) if len(sys.argv) > 2 else {}
     mode = params.get("mode", "widget")
@@ -504,6 +552,20 @@ def main() -> None:
             xbmcplugin.endOfDirectory(HANDLE)
         except Exception:
             pass
+    elif mode == "refresh_widgets":
+        _notify_action("REFRESH_WIDGETS", "Widgets refreshed")
+    elif mode == "reload_skin":
+        xbmc.executebuiltin("ReloadSkin()")
+        try:
+            xbmcplugin.endOfDirectory(HANDLE)
+        except Exception:
+            pass
+    elif mode == "apply_settings":
+        _apply_server_settings()
+    elif mode == "played":
+        _notify_action(f"PLAYED {params.get('id', '')}", "Marked watched")
+    elif mode == "favorite":
+        _notify_action(f"FAVORITE {params.get('id', '')}", "Favorite updated")
     elif mode == "resync":
         try:
             ipc_call("RESYNC", timeout=2.0, wait_daemon=5.0)

@@ -42,6 +42,9 @@ pub struct PlayResolve {
     pub plot: String,
     pub media_type: String,
     pub streams: PlaybackStreams,
+    pub intro_start_secs: i64,
+    pub intro_end_secs: i64,
+    pub series_id: String,
 }
 
 pub async fn resolve_play(
@@ -49,11 +52,15 @@ pub async fn resolve_play(
     state: Option<&std::sync::Arc<crate::state::AppState>>,
     item_id: &str,
 ) -> Result<PlayResolve> {
-    let (info_res, item_res) =
-        tokio::join!(client.playback_info(item_id), client.get_item(item_id));
+    let (info_res, item_res, intro_res) = tokio::join!(
+        client.playback_info(item_id),
+        client.get_item(item_id),
+        client.media_intro(item_id),
+    );
 
     let info = info_res?;
     let item = item_res.ok();
+    let (intro_start_secs, intro_end_secs) = intro_res.unwrap_or((0, 0));
 
     let play_session_id = info.play_session_id.unwrap_or_default();
 
@@ -99,6 +106,10 @@ pub async fn resolve_play(
         .as_ref()
         .map(|i| i.item_type.to_ascii_lowercase())
         .unwrap_or_else(|| "video".into());
+    let series_id = item
+        .as_ref()
+        .and_then(|i| i.series_id.clone())
+        .unwrap_or_default();
 
     Ok(PlayResolve {
         stream_url,
@@ -114,6 +125,9 @@ pub async fn resolve_play(
         plot,
         media_type,
         streams,
+        intro_start_secs,
+        intro_end_secs,
+        series_id,
     })
 }
 

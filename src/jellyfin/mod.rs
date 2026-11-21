@@ -149,7 +149,76 @@ impl JellyfinClient {
     /// Paginated library items (Movie/Series/Season/Episode/BoxSet).
     /// Only page 0 requests `TotalRecordCount` (avoids a full-table COUNT on every page).
     pub async fn get_item(&self, item_id: &str) -> Result<JellyfinItem> {
-        let q = format!("/Users/{}/Items/{}", self.user_id, item_id);
+        let fields = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Genres,Studios,People,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear,MediaStreams,Tagline,Tags,ProductionLocations,RemoteTrailers,SortName,Status,ImageTags,VoteCount";
+        let q = format!(
+            "/Users/{}/Items/{}?Fields={}",
+            self.user_id,
+            urlencoding(item_id),
+            urlencoding(fields)
+        );
+        self.get_json(&q).await
+    }
+
+    pub async fn media_intro(&self, item_id: &str) -> Result<(i64, i64)> {
+        let q = format!("/MediaSegments/{}", urlencoding(item_id));
+        let v: serde_json::Value = self.get_json(&q).await?;
+        let empty = Vec::new();
+        let arr = v
+            .as_array()
+            .or_else(|| v.get("Items").and_then(|i| i.as_array()))
+            .unwrap_or(&empty);
+        for seg in arr {
+            let kind = seg.get("Type").and_then(|t| t.as_str()).unwrap_or("");
+            if kind.eq_ignore_ascii_case("Intro") {
+                let start = seg.get("StartTicks").and_then(|n| n.as_i64()).unwrap_or(0) / 10_000_000;
+                let end = seg.get("EndTicks").and_then(|n| n.as_i64()).unwrap_or(0) / 10_000_000;
+                return Ok((start, end));
+            }
+        }
+        Ok((0, 0))
+    }
+
+    pub async fn adjacent_next(&self, series_id: &str, item_id: &str) -> Result<Option<JellyfinItem>> {
+        let q = format!(
+            "/Shows/{}/Episodes?UserId={}&AdjacentTo={}&Limit=3",
+            urlencoding(series_id),
+            self.user_id,
+            urlencoding(item_id)
+        );
+        let env: ItemsEnvelope = self.get_json(&q).await?;
+        let mut seen = false;
+        for it in env.items {
+            if seen {
+                return Ok(Some(it));
+            }
+            if it.id == item_id {
+                seen = true;
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn mark_played(&self, item_id: &str) -> Result<()> {
+        self.post_empty(
+            &format!("/Users/{}/PlayedItems/{}", self.user_id, urlencoding(item_id)),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn mark_favorite(&self, item_id: &str) -> Result<()> {
+        self.post_empty(
+            &format!("/Users/{}/FavoriteItems/{}", self.user_id, urlencoding(item_id)),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn persons(&self, limit: u32) -> Result<ItemsEnvelope> {
+        let q = format!(
+            "/Persons?UserId={}&Limit={}&Recursive=true",
+            self.user_id, limit
+        );
         self.get_json(&q).await
     }
 

@@ -114,6 +114,27 @@ def stop_stale_daemon() -> None:
             pass
 
 
+def _setting_on(name: str) -> bool:
+    return ADDON.getSetting(name) == "true"
+
+
+def _play_next(item_id: str, series_id: str) -> None:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(8.0)
+            s.connect(sock_path())
+            s.sendall(f"NEXT {item_id} {series_id}\n".encode("utf-8"))
+            raw = s.recv(4096)
+        payload = json.loads(raw.decode("utf-8").strip() or "{}")
+        nxt = payload.get("id")
+        if nxt:
+            xbmc.executebuiltin(
+                f"PlayMedia(plugin://plugin.video.jellykodi/?mode=play&id={nxt})"
+            )
+    except Exception as exc:
+        xbmc.log(f"[jellykodi] play next skipped: {exc}", xbmc.LOGINFO)
+
+
 def notify_daemon(payload: dict) -> None:
     try:
         xbmc.log(
@@ -137,6 +158,7 @@ class UnifiedJellyPlayer(xbmc.Player):
         self.item_id = ""
         self.media_source_id = ""
         self.play_session_id = ""
+        self.intro_skipped = False
 
     def _capture_ids(self) -> None:
         try:
@@ -306,7 +328,15 @@ class UnifiedJellyPlayer(xbmc.Player):
                 xbmc.executebuiltin("Container.Refresh")
             except Exception:
                 pass
+            item_id = self.item_id
+            series_id = ""
+            try:
+                series_id = xbmcgui.Window(10000).getProperty("jellykodi.series_id")
+            except Exception:
+                pass
             self._clear_session()
+            if item_id and series_id and _setting_on("play_next"):
+                _play_next(item_id, series_id)
 
     def onPlayBackError(self) -> None:
         xbmc.log(f"[jellykodi] onPlayBackError item_id={self.item_id}", xbmc.LOGINFO)
@@ -330,6 +360,7 @@ class UnifiedJellyPlayer(xbmc.Player):
             self._clear_session()
 
     def _clear_session(self) -> None:
+        self.intro_skipped = False
         self.item_id = ""
         self.media_source_id = ""
         self.play_session_id = ""
@@ -342,6 +373,9 @@ class UnifiedJellyPlayer(xbmc.Player):
             win.clearProperty("jellykodi.duration")
             win.clearProperty("jellykodi.start_offset")
             win.clearProperty("jellykodi.stream_url")
+            win.clearProperty("jellykodi.intro_start")
+            win.clearProperty("jellykodi.intro_end")
+            win.clearProperty("jellykodi.series_id")
         except Exception:
             pass
 
@@ -375,9 +409,10 @@ def run_service() -> None:
     try:
         while not monitor.abortRequested():
             _tick += 1
-            # After daemon is up: refresh widget cache, then bounce Home once so
-            # Arctic right-side rows (hidden while NumItems==0 from boot race)
-            # re-query plugin:// paths. Guarded so skin/service restarts do not loop.
+            # Skin builds home containers before this service starts the daemon.
+            # ReloadSkin once per Kodi process after the widget cache is warm.
+            # The flag is keyed by the Kodi pid so a skin reload does not loop,
+            # and the next boot (new pid) refreshes again.
             if not widgets_primed and daemon_healthy():
                 try:
                     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
@@ -385,17 +420,33 @@ def run_service() -> None:
                         s.connect(sock_path())
                         s.sendall(b"REFRESH_WIDGETS\n")
                         s.recv(4096)
-                    flag = os.path.join(profile(), ".home_widget_boot_refresh")
-                    if not os.path.exists(flag):
-                        open(flag, "w").close()
-                        xbmc.executebuiltin("ReplaceWindow(Home)")
-                        xbmc.log(
-                            "[jellykodi] primed widgets + ReplaceWindow(Home)",
-                            xbmc.LOGINFO,
-                        )
                     widgets_primed = True
+                    skin_flag = f"/tmp/jellykodi-skin-{os.getppid()}"
+                    if not os.path.exists(skin_flag):
+                        open(skin_flag, "w").close()
+                        xbmc.executebuiltin("ReloadSkin()")
+                        xbmc.log("[jellykodi] primed widgets + ReloadSkin", xbmc.LOGINFO)
                 except OSError as exc:
                     xbmc.log(f"[jellykodi] widget prime defer: {exc}", xbmc.LOGWARNING)
+            restart_flag = os.path.join(profile(), ".restart_daemon")
+            if os.path.exists(restart_flag):
+                try:
+                    os.remove(restart_flag)
+                except OSError:
+                    pass
+                if proc is not None and proc.poll() is None:
+                    proc.terminate()
+                    xbmc.log("[jellykodi] restarting daemon after settings apply", xbmc.LOGINFO)
+                else:
+                    try:
+                        out = subprocess.check_output(["pgrep", "-f", bin_path], text=True)
+                    except (subprocess.CalledProcessError, FileNotFoundError):
+                        out = ""
+                    for pid_s in out.split():
+                        try:
+                            os.kill(int(pid_s.strip()), signal.SIGTERM)
+                        except (ValueError, ProcessLookupError, PermissionError):
+                            pass
             if proc is not None and proc.poll() is not None:
                 xbmc.log(
                     f"[jellykodi] daemon exited code={proc.returncode}; restarting",
@@ -427,6 +478,16 @@ def run_service() -> None:
                     player._capture_ids()
                 try:
                     player.current_pos = player.getTime()
+                    if _setting_on("intro_skip") and not player.intro_skipped:
+                        win = xbmcgui.Window(10000)
+                        intro_end = float(win.getProperty("jellykodi.intro_end") or 0)
+                        intro_start = float(win.getProperty("jellykodi.intro_start") or 0)
+                        if (
+                            intro_end > intro_start
+                            and intro_start <= player.current_pos < intro_end - 1
+                        ):
+                            player.seekTime(intro_end)
+                            player.intro_skipped = True
                     if player.duration <= 0.0:
                         player.duration = player.getTotalTime()
                     if _tick % 5 == 0 and player.item_id:

@@ -21,3 +21,47 @@ msgstr "Access token"
 msgctxt "#32005"
 msgid "Device ID"
 msgstr "Device ID"
+
+msgctxt "#32006"
+msgid "Save and restart service"
+msgstr "Save and restart service"
+
+msgctxt "#32010"
+msgid "Library"
+msgstr "Library"
+
+msgctxt "#32011"
+msgid "Refresh home widgets"
+msgstr "Refresh home widgets"
+
+msgctxt "#32012"
+msgid "Full library resync"
+msgstr "Full library resync"
+
+msgctxt "#32013"
+msgid "Reload skin"
+msgstr "Reload skin"
+
+msgctxt "#32014"
+msgid "Service status"
+msgstr "Service status"
+
+msgctxt "#32020"
+msgid "Playback"
+msgstr "Playback"
+
+msgctxt "#32021"
+msgid "Skip intros"
+msgstr "Skip intros"
+
+msgctxt "#32022"
+msgid "Play next episode"
+msgstr "Play next episode"
+
+msgctxt "#32023"
+msgid "Ask before resuming"
+msgstr "Ask before resuming"
+
+msgctxt "#32040"
+msgid "JellyKodi actions"
+msgstr "JellyKodi actions"

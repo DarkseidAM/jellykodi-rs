@@ -1,0 +1,14 @@
+[Unit]
+Description=jellykodi-rs sidecar
+# Start before Kodi so the widget socket exists when the skin builds home.
+Before=kodi.service
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/storage/.kodi/addons/plugin.video.jellykodi/bin/jellykodi-rs --config /storage/.kodi/userdata/addon_data/plugin.video.jellykodi/config.json
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=kodi.service

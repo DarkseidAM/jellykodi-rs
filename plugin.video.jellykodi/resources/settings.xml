@@ -5,5 +5,17 @@
     <setting id="user_id" type="text" label="32003" default="" />
     <setting id="access_token" type="text" label="32004" default="" option="secret" />
     <setting id="device_id" type="text" label="32005" default="jellykodi-coreelec" />
+    <setting id="apply_settings" type="action" label="32006" action="RunPlugin(plugin://plugin.video.jellykodi/?mode=apply_settings)" />
+  </category>
+  <category label="32010">
+    <setting id="refresh_widgets" type="action" label="32011" action="RunPlugin(plugin://plugin.video.jellykodi/?mode=refresh_widgets)" />
+    <setting id="full_resync" type="action" label="32012" action="RunPlugin(plugin://plugin.video.jellykodi/?mode=resync)" />
+    <setting id="reload_skin" type="action" label="32013" action="RunPlugin(plugin://plugin.video.jellykodi/?mode=reload_skin)" />
+    <setting id="show_status" type="action" label="32014" action="RunPlugin(plugin://plugin.video.jellykodi/?mode=status)" />
+  </category>
+  <category label="32020">
+    <setting id="intro_skip" type="bool" label="32021" default="true" />
+    <setting id="play_next" type="bool" label="32022" default="true" />
+    <setting id="resume_prompt" type="bool" label="32023" default="true" />
   </category>
 </settings>

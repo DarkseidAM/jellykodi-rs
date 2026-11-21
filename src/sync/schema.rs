@@ -14,13 +14,33 @@ const VIDEO_VERSION_ID_DEFAULT: i64 = 40400;
 /// MyVideos150 (Piers): VideoAssetType::VERSION == 1 (was 0 on Omega).
 const VIDEO_ASSET_TYPE_VERSION: i64 = 1;
 
+#[derive(Debug, Clone)]
+pub struct MapEntry {
+    pub jellyfin_id: String,
+    pub kind: String,
+    pub kodi_id: i64,
+    pub file_id: i64,
+}
+
 pub struct FkCache {
     actors: FxHashMap<String, i64>,
+    genres: FxHashMap<String, i64>,
+    studios: FxHashMap<String, i64>,
+    tags: FxHashMap<String, i64>,
+    countries: FxHashMap<String, i64>,
     shows: FxHashMap<String, i64>, // jellyfin series id -> idShow
     shows_by_title: FxHashMap<String, i64>, // lowercased series title -> idShow (merges alternate series IDs)
     seasons: FxHashMap<String, i64>,
     seasons_by_show_and_num: FxHashMap<(i64, i32), i64>, // (idShow, season_num) -> idSeason
+    movies: FxHashMap<String, i64>,
+    boxsets: FxHashMap<String, i64>,
+    map_rows: Vec<MapEntry>,
+    pending_versions: Vec<JellyfinItem>,
     next_actor: i64,
+    next_genre: i64,
+    next_studio: i64,
+    next_tag: i64,
+    next_country: i64,
     next_file: i64,
     next_movie: i64,
     next_show: i64,
@@ -51,7 +71,10 @@ pub fn open_fresh_db(path: &Path) -> Result<Connection> {
 /// Return staging DB to Kodi-safe journal/sync settings before swap.
 pub fn finalize_staging_db(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(
-        "PRAGMA journal_mode = DELETE;
+        "CREATE INDEX IF NOT EXISTS idx_movie_c00 ON movie (c00);
+         CREATE INDEX IF NOT EXISTS idx_tvshow_c00 ON tvshow (c00);
+         CREATE INDEX IF NOT EXISTS idx_episode_c00 ON episode (c00);
+         PRAGMA journal_mode = DELETE;
          PRAGMA synchronous = NORMAL;
          PRAGMA optimize;",
     )?;
@@ -75,11 +98,23 @@ impl FkCache {
         )?;
         Ok(Self {
             actors: FxHashMap::default(),
+            genres: FxHashMap::default(),
+            studios: FxHashMap::default(),
+            tags: FxHashMap::default(),
+            countries: FxHashMap::default(),
             shows: FxHashMap::default(),
             shows_by_title: FxHashMap::default(),
             seasons: FxHashMap::default(),
             seasons_by_show_and_num: FxHashMap::default(),
+            movies: FxHashMap::default(),
+            boxsets: FxHashMap::default(),
+            map_rows: Vec::new(),
+            pending_versions: Vec::new(),
             next_actor: 1,
+            next_genre: 1,
+            next_studio: 1,
+            next_tag: 1,
+            next_country: 1,
             next_file: 1,
             next_movie: 1,
             next_show: 1,
@@ -92,6 +127,60 @@ impl FkCache {
             tv_path_id: 2,
         })
     }
+
+    pub fn movie_id(&self, jellyfin_id: &str) -> Option<i64> {
+        self.movies.get(jellyfin_id).copied()
+    }
+
+    pub fn boxset_pairs(&self) -> Vec<(String, i64)> {
+        self.boxsets.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
+    pub fn take_map(&mut self) -> Vec<MapEntry> {
+        std::mem::take(&mut self.map_rows)
+    }
+
+    /// Continue numbering and name tables on a database Kodi already has open.
+    pub fn resume(conn: &Connection) -> Result<Self> {
+        let mut cache = Self::init(conn)?;
+        cache.next_file = max_plus(conn, "SELECT COALESCE(MAX(idFile),0) FROM files")?;
+        cache.next_movie = max_plus(conn, "SELECT COALESCE(MAX(idMovie),0) FROM movie")?;
+        cache.next_show = max_plus(conn, "SELECT COALESCE(MAX(idShow),0) FROM tvshow")?;
+        cache.next_season = max_plus(conn, "SELECT COALESCE(MAX(idSeason),0) FROM seasons")?;
+        cache.next_episode = max_plus(conn, "SELECT COALESCE(MAX(idEpisode),0) FROM episode")?;
+        cache.next_set = max_plus(conn, "SELECT COALESCE(MAX(idSet),0) FROM sets")?;
+        cache.next_rating = max_plus(conn, "SELECT COALESCE(MAX(rating_id),0) FROM rating")?;
+        cache.next_uniqueid = max_plus(conn, "SELECT COALESCE(MAX(uniqueid_id),0) FROM uniqueid")?;
+        load_name_map(conn, "SELECT genre_id, name FROM genre", &mut cache.genres, &mut cache.next_genre)?;
+        load_name_map(conn, "SELECT studio_id, name FROM studio", &mut cache.studios, &mut cache.next_studio)?;
+        load_name_map(conn, "SELECT tag_id, name FROM tag", &mut cache.tags, &mut cache.next_tag)?;
+        load_name_map(conn, "SELECT country_id, name FROM country", &mut cache.countries, &mut cache.next_country)?;
+        load_name_map(conn, "SELECT actor_id, name FROM actor", &mut cache.actors, &mut cache.next_actor)?;
+        Ok(cache)
+    }
+}
+
+fn max_plus(conn: &Connection, sql: &str) -> Result<i64> {
+    let n: i64 = conn.query_row(sql, [], |r| r.get(0))?;
+    Ok(n + 1)
+}
+
+fn load_name_map(
+    conn: &Connection,
+    sql: &str,
+    map: &mut FxHashMap<String, i64>,
+    next: &mut i64,
+) -> Result<()> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let mut max_id = 0i64;
+    for row in rows {
+        let (id, name) = row?;
+        max_id = max_id.max(id);
+        map.insert(name, id);
+    }
+    *next = max_id + 1;
+    Ok(())
 }
 
 pub fn bulk_insert_items(
@@ -106,11 +195,20 @@ pub fn bulk_insert_items(
         for item in items {
             match item.item_type.as_str() {
                 "Movie" => insert_movie(&tx, cache, client, item, cast_limit)?,
-                "Series" => insert_series(&tx, cache, client, item)?,
+                "Series" => insert_series(&tx, cache, client, item, cast_limit)?,
                 "Season" => insert_season(&tx, cache, client, item)?,
                 "Episode" => insert_episode(&tx, cache, client, item, cast_limit)?,
                 "BoxSet" => insert_boxset(&tx, cache, client, item)?,
                 _ => {}
+            }
+        }
+        let pending = std::mem::take(&mut cache.pending_versions);
+        for item in pending {
+            let primary = item.primary_version_id.clone().unwrap_or_default();
+            if let Some(movie_id) = cache.movies.get(&primary).copied() {
+                insert_alternate_file(&tx, cache, client, &item, movie_id)?;
+            } else {
+                insert_movie(&tx, cache, client, &item, cast_limit)?;
             }
         }
     }
@@ -125,6 +223,16 @@ fn insert_movie(
     item: &JellyfinItem,
     cast_limit: usize,
 ) -> Result<()> {
+    if let Some(pid) = &item.primary_version_id
+        && pid != &item.id
+    {
+        if let Some(movie_id) = cache.movies.get(pid).copied() {
+            insert_alternate_file(tx, cache, client, item, movie_id)?;
+            return Ok(());
+        }
+        cache.pending_versions.push(item.clone());
+        return Ok(());
+    }
     let file_id = cache.next_file;
     cache.next_file += 1;
     let movie_id = cache.next_movie;
@@ -145,34 +253,47 @@ fn insert_movie(
             item.premiered.as_deref().unwrap_or("")
         ])?;
     }
-    let genres = item
-        .genres
-        .as_ref()
-        .map(|g| g.join(" / "))
-        .unwrap_or_default();
-    let studios = item
-        .studios
-        .as_ref()
-        .map(|s| s.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(" / "))
-        .unwrap_or_default();
+    let genres = join_list(item.genres.as_deref());
+    let studios = join_named(item.studios.as_deref());
+    let writers = people_named(item, "Writer");
+    let directors = people_named(item, "Director");
+    let countries = join_list(item.production_locations.as_deref());
+    let trailer = trailer_url(item);
+    let sort = item.sort_name.clone().unwrap_or_else(|| item.name.clone());
+    let short_plot: String = item
+        .overview
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .take(255)
+        .collect();
     let rating_id = insert_rating(tx, cache, movie_id, "movie", item)?;
     let uniqueid_id = insert_uniqueid(tx, cache, movie_id, "movie", item)?;
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO movie (idMovie, idFile, c00, c01, c05, c07, c09, c11, c12, c14, c18, premiered) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            "INSERT INTO movie (idMovie, idFile, c00, c01, c02, c03, c04, c05, c06, c07, c09, c10, c11, c12, c14, c15, c16, c18, c19, c21, premiered) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
         )?;
         stmt.execute(params![
             movie_id,
             file_id,
             item.name,
             item.overview.as_deref().unwrap_or(""),
+            short_plot,
+            item.tagline.as_deref().unwrap_or(""),
+            item.vote_count.unwrap_or(0).to_string(),
             rating_id.map(|id| id.to_string()).unwrap_or_default(),
+            writers,
             item.year.unwrap_or(0).to_string(),
             uniqueid_id.map(|id| id.to_string()).unwrap_or_default(),
+            sort,
             duration.to_string(),
             item.mpaa.as_deref().unwrap_or(""),
             genres,
+            directors,
+            item.name,
             studios,
+            trailer,
+            countries,
             item.premiered.as_deref().unwrap_or("")
         ])?;
     }
@@ -187,7 +308,7 @@ fn insert_movie(
             VIDEO_VERSION_ID_DEFAULT
         ])?;
     }
-    insert_art(tx, movie_id, "movie", client, &item.id)?;
+    insert_art(tx, movie_id, "movie", client, item)?;
     if let Some(ref streams) = item.media_streams {
         insert_streamdetails(tx, file_id, streams, duration)?;
     }
@@ -198,6 +319,13 @@ fn insert_movie(
         stmt.execute(params![file_id, pos as f64, duration as f64])?;
     }
     insert_cast(tx, cache, item, movie_id, "movie", cast_limit)?;
+    link_crew(tx, cache, item, movie_id, "movie")?;
+    link_names(tx, cache, item.genres.as_deref().unwrap_or(&[]), "genre", "genre_id", "genre_link", movie_id, "movie")?;
+    link_named_rows(tx, cache, item.studios.as_deref(), movie_id, "movie")?;
+    link_names(tx, cache, item.tags.as_deref().unwrap_or(&[]), "tag", "tag_id", "tag_link", movie_id, "movie")?;
+    link_names(tx, cache, item.production_locations.as_deref().unwrap_or(&[]), "country", "country_id", "country_link", movie_id, "movie")?;
+    cache.movies.insert(item.id.clone(), movie_id);
+    remember(cache, &item.id, "movie", movie_id, file_id);
     Ok(())
 }
 
@@ -206,6 +334,7 @@ fn insert_series(
     cache: &mut FkCache,
     client: &JellyfinClient,
     item: &JellyfinItem,
+    cast_limit: usize,
 ) -> Result<()> {
     let genres = item
         .genres
@@ -257,7 +386,10 @@ fn insert_series(
                 tx.prepare_cached("DELETE FROM art WHERE media_id=?1 AND media_type='tvshow'")?;
             stmt.execute(params![show_id])?;
         }
-        insert_art(tx, show_id, "tvshow", client, &item.id)?;
+        insert_art(tx, show_id, "tvshow", client, item)?;
+        clear_links(tx, show_id, "tvshow")?;
+        link_show_meta(tx, cache, item, show_id, cast_limit)?;
+        remember(cache, &item.id, "tvshow", show_id, 0);
         return Ok(());
     }
 
@@ -269,18 +401,23 @@ fn insert_series(
     let uniqueid_id = insert_uniqueid(tx, cache, show_id, "tvshow", item)?;
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO tvshow (idShow, c00, c01, c04, c05, c08, c12, c13, c14) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            "INSERT INTO tvshow (idShow, c00, c01, c02, c04, c05, c08, c09, c10, c12, c13, c14, c15, c16) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         )?;
         stmt.execute(params![
             show_id,
             item.name,
             item.overview.as_deref().unwrap_or(""),
+            item.status.as_deref().unwrap_or(""),
             rating_id.map(|id| id.to_string()).unwrap_or_default(),
             item.premiered.as_deref().unwrap_or(""),
             genres,
+            item.name,
+            "disintegrate browse bug",
             uniqueid_id.map(|id| id.to_string()).unwrap_or_default(),
             item.mpaa.as_deref().unwrap_or(""),
-            studios
+            studios,
+            item.sort_name.as_deref().unwrap_or(&item.name),
+            trailer_url(item),
         ])?;
     }
     {
@@ -289,7 +426,9 @@ fn insert_series(
         )?;
         stmt.execute(params![show_id, cache.tv_path_id])?;
     }
-    insert_art(tx, show_id, "tvshow", client, &item.id)?;
+    insert_art(tx, show_id, "tvshow", client, item)?;
+    link_show_meta(tx, cache, item, show_id, cast_limit)?;
+    remember(cache, &item.id, "tvshow", show_id, 0);
     Ok(())
 }
 
@@ -356,7 +495,8 @@ fn insert_season(
         )?;
         stmt.execute(params![season_id, show_id, num, item.name])?;
     }
-    insert_art(tx, season_id, "season", client, &item.id)?;
+    insert_art(tx, season_id, "season", client, item)?;
+    remember(cache, &item.id, "season", season_id, 0);
     Ok(())
 }
 
@@ -413,7 +553,7 @@ fn insert_episode(
     let uniqueid_id = insert_uniqueid(tx, cache, ep_id, "episode", item)?;
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO episode (idEpisode, idFile, c00, c01, c03, c05, c09, c12, c13, c20, idShow, idSeason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            "INSERT INTO episode (idEpisode, idFile, c00, c01, c03, c04, c05, c09, c10, c12, c13, c20, idShow, idSeason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         )?;
         stmt.execute(params![
             ep_id,
@@ -421,8 +561,10 @@ fn insert_episode(
             item.name,
             item.overview.as_deref().unwrap_or(""),
             rating_id.map(|id| id.to_string()).unwrap_or_default(),
+            people_named(item, "Writer"),
             premiered,
             duration_str,
+            people_named(item, "Director"),
             item.parent_index.unwrap_or(0).to_string(),
             item.index_number.unwrap_or(0).to_string(),
             uniqueid_id.map(|id| id.to_string()).unwrap_or_default(),
@@ -430,7 +572,7 @@ fn insert_episode(
             season_id
         ])?;
     }
-    insert_art(tx, ep_id, "episode", client, &item.id)?;
+    insert_art(tx, ep_id, "episode", client, item)?;
     if let Some(ref streams) = item.media_streams {
         insert_streamdetails(tx, file_id, streams, duration)?;
     }
@@ -443,6 +585,8 @@ fn insert_episode(
     if cast_limit > 0 {
         insert_cast(tx, cache, item, ep_id, "episode", cast_limit)?;
     }
+    link_crew(tx, cache, item, ep_id, "episode")?;
+    remember(cache, &item.id, "episode", ep_id, file_id);
     Ok(())
 }
 
@@ -463,7 +607,9 @@ fn insert_boxset(
             item.overview.as_deref().unwrap_or("")
         ])?;
     }
-    insert_art(tx, set_id, "set", client, &item.id)?;
+    insert_art(tx, set_id, "set", client, item)?;
+    cache.boxsets.insert(item.id.clone(), set_id);
+    remember(cache, &item.id, "set", set_id, 0);
     Ok(())
 }
 
@@ -480,9 +626,15 @@ fn insert_rating(
     let id = cache.next_rating;
     cache.next_rating += 1;
     let mut stmt = tx.prepare_cached(
-        "INSERT INTO rating (rating_id, media_id, media_type, rating_type, rating, votes) VALUES (?1,?2,?3,'default',?4,0)",
+        "INSERT INTO rating (rating_id, media_id, media_type, rating_type, rating, votes) VALUES (?1,?2,?3,'default',?4,?5)",
     )?;
-    stmt.execute(params![id, media_id, media_type, rating])?;
+    stmt.execute(params![
+        id,
+        media_id,
+        media_type,
+        rating,
+        item.vote_count.unwrap_or(0)
+    ])?;
     Ok(Some(id))
 }
 
@@ -519,28 +671,324 @@ fn insert_art(
     media_id: i64,
     media_type: &str,
     client: &JellyfinClient,
-    item_id: &str,
+    item: &JellyfinItem,
 ) -> Result<()> {
-    let poster = client.image_url(item_id, "Primary", 720);
-    let fanart = client.image_url(item_id, "Backdrop", 1920);
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO art (media_id, media_type, type, url) VALUES (?1,?2,'poster',?3)",
-        )?;
-        stmt.execute(params![media_id, media_type, &poster])?;
+    let poster = client.image_url(&item.id, "Primary", 720);
+    let fanart = client.image_url(&item.id, "Backdrop", 1920);
+    write_art(tx, media_id, media_type, "poster", &poster)?;
+    write_art(tx, media_id, media_type, "thumb", &poster)?;
+    write_art(tx, media_id, media_type, "fanart", &fanart)?;
+    for (tag, kind) in [
+        ("Logo", "clearlogo"),
+        ("Banner", "banner"),
+        ("Disc", "discart"),
+        ("Thumb", "landscape"),
+        ("Art", "clearart"),
+    ] {
+        if has_image(item, tag) {
+            let url = client.image_url(&item.id, tag, 800);
+            write_art(tx, media_id, media_type, kind, &url)?;
+        }
     }
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO art (media_id, media_type, type, url) VALUES (?1,?2,'thumb',?3)",
-        )?;
-        stmt.execute(params![media_id, media_type, &poster])?;
+    Ok(())
+}
+
+fn write_art(
+    tx: &rusqlite::Transaction<'_>,
+    media_id: i64,
+    media_type: &str,
+    kind: &str,
+    url: &str,
+) -> Result<()> {
+    let mut stmt = tx.prepare_cached(
+        "INSERT INTO art (media_id, media_type, type, url) VALUES (?1,?2,?3,?4)",
+    )?;
+    stmt.execute(params![media_id, media_type, kind, url])?;
+    Ok(())
+}
+
+fn has_image(item: &JellyfinItem, key: &str) -> bool {
+    item.image_tags
+        .as_ref()
+        .and_then(|m| m.get(key))
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
+}
+
+fn join_list(values: Option<&[String]>) -> String {
+    values
+        .map(|v| v.join(" / "))
+        .unwrap_or_default()
+}
+
+fn join_named(values: Option<&[crate::jellyfin::types::Named]>) -> String {
+    values
+        .map(|v| {
+            v.iter()
+                .map(|x| x.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
+        .unwrap_or_default()
+}
+
+fn people_named(item: &JellyfinItem, kind: &str) -> String {
+    item.people
+        .as_ref()
+        .map(|people| {
+            people
+                .iter()
+                .filter(|p| p.person_type.as_deref() == Some(kind))
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
+        .unwrap_or_default()
+}
+
+fn trailer_url(item: &JellyfinItem) -> String {
+    item.remote_trailers
+        .as_ref()
+        .and_then(|t| t.first())
+        .and_then(|t| t.url.clone())
+        .unwrap_or_default()
+}
+
+fn remember(cache: &mut FkCache, jellyfin_id: &str, kind: &str, kodi_id: i64, file_id: i64) {
+    cache.map_rows.push(MapEntry {
+        jellyfin_id: jellyfin_id.to_string(),
+        kind: kind.to_string(),
+        kodi_id,
+        file_id,
+    });
+}
+
+fn actor_id(tx: &rusqlite::Transaction<'_>, cache: &mut FkCache, name: &str) -> Result<i64> {
+    if let Some(&id) = cache.actors.get(name) {
+        return Ok(id);
     }
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO art (media_id, media_type, type, url) VALUES (?1,?2,'fanart',?3)",
-        )?;
-        stmt.execute(params![media_id, media_type, &fanart])?;
+    let id = cache.next_actor;
+    cache.next_actor += 1;
+    let mut stmt = tx.prepare_cached("INSERT INTO actor (actor_id, name) VALUES (?1,?2)")?;
+    stmt.execute(params![id, name])?;
+    cache.actors.insert(name.to_string(), id);
+    Ok(id)
+}
+
+fn link_crew(
+    tx: &rusqlite::Transaction<'_>,
+    cache: &mut FkCache,
+    item: &JellyfinItem,
+    media_id: i64,
+    media_type: &str,
+) -> Result<()> {
+    let Some(people) = &item.people else {
+        return Ok(());
+    };
+    for person in people {
+        let table = match person.person_type.as_deref() {
+            Some("Director") => "director_link",
+            Some("Writer") => "writer_link",
+            _ => continue,
+        };
+        let id = actor_id(tx, cache, &person.name)?;
+        let sql = format!(
+            "INSERT INTO {table} (actor_id, media_id, media_type) VALUES (?1,?2,?3)"
+        );
+        let mut stmt = tx.prepare_cached(&sql)?;
+        stmt.execute(params![id, media_id, media_type])?;
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn link_names(
+    tx: &rusqlite::Transaction<'_>,
+    cache: &mut FkCache,
+    names: &[String],
+    table: &str,
+    id_col: &str,
+    link_table: &str,
+    media_id: i64,
+    media_type: &str,
+) -> Result<()> {
+    for raw in names {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let id = named_id(tx, cache, table, id_col, name)?;
+        let sql = format!(
+            "INSERT INTO {link_table} ({id_col}, media_id, media_type) VALUES (?1,?2,?3)"
+        );
+        let mut stmt = tx.prepare_cached(&sql)?;
+        stmt.execute(params![id, media_id, media_type])?;
+    }
+    Ok(())
+}
+
+fn named_id(
+    tx: &rusqlite::Transaction<'_>,
+    cache: &mut FkCache,
+    table: &str,
+    id_col: &str,
+    name: &str,
+) -> Result<i64> {
+    let existing = match table {
+        "genre" => cache.genres.get(name).copied(),
+        "tag" => cache.tags.get(name).copied(),
+        "country" => cache.countries.get(name).copied(),
+        _ => None,
+    };
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    let id = match table {
+        "genre" => {
+            let id = cache.next_genre;
+            cache.next_genre += 1;
+            id
+        }
+        "tag" => {
+            let id = cache.next_tag;
+            cache.next_tag += 1;
+            id
+        }
+        "country" => {
+            let id = cache.next_country;
+            cache.next_country += 1;
+            id
+        }
+        _ => return Ok(0),
+    };
+    let sql = format!("INSERT INTO {table} ({id_col}, name) VALUES (?1,?2)");
+    let mut stmt = tx.prepare_cached(&sql)?;
+    stmt.execute(params![id, name])?;
+    match table {
+        "genre" => {
+            cache.genres.insert(name.to_string(), id);
+        }
+        "tag" => {
+            cache.tags.insert(name.to_string(), id);
+        }
+        "country" => {
+            cache.countries.insert(name.to_string(), id);
+        }
+        _ => {}
+    }
+    Ok(id)
+}
+
+fn link_named_rows(
+    tx: &rusqlite::Transaction<'_>,
+    cache: &mut FkCache,
+    studios: Option<&[crate::jellyfin::types::Named]>,
+    media_id: i64,
+    media_type: &str,
+) -> Result<()> {
+    let Some(studios) = studios else {
+        return Ok(());
+    };
+    for studio in studios {
+        let name = studio.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let id = if let Some(&id) = cache.studios.get(name) {
+            id
+        } else {
+            let id = cache.next_studio;
+            cache.next_studio += 1;
+            let mut stmt = tx.prepare_cached("INSERT INTO studio (studio_id, name) VALUES (?1,?2)")?;
+            stmt.execute(params![id, name])?;
+            cache.studios.insert(name.to_string(), id);
+            id
+        };
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO studio_link (studio_id, media_id, media_type) VALUES (?1,?2,?3)",
+        )?;
+        stmt.execute(params![id, media_id, media_type])?;
+    }
+    Ok(())
+}
+
+fn clear_links(tx: &rusqlite::Transaction<'_>, media_id: i64, media_type: &str) -> Result<()> {
+    for table in [
+        "actor_link",
+        "director_link",
+        "writer_link",
+        "genre_link",
+        "studio_link",
+        "tag_link",
+        "country_link",
+    ] {
+        let sql = format!("DELETE FROM {table} WHERE media_id=?1 AND media_type=?2");
+        tx.execute(&sql, params![media_id, media_type])?;
+    }
+    Ok(())
+}
+
+fn link_show_meta(
+    tx: &rusqlite::Transaction<'_>,
+    cache: &mut FkCache,
+    item: &JellyfinItem,
+    show_id: i64,
+    cast_limit: usize,
+) -> Result<()> {
+    insert_cast(tx, cache, item, show_id, "tvshow", cast_limit)?;
+    link_crew(tx, cache, item, show_id, "tvshow")?;
+    link_names(tx, cache, item.genres.as_deref().unwrap_or(&[]), "genre", "genre_id", "genre_link", show_id, "tvshow")?;
+    link_named_rows(tx, cache, item.studios.as_deref(), show_id, "tvshow")?;
+    link_names(tx, cache, item.tags.as_deref().unwrap_or(&[]), "tag", "tag_id", "tag_link", show_id, "tvshow")?;
+    Ok(())
+}
+
+fn insert_alternate_file(
+    tx: &rusqlite::Transaction<'_>,
+    cache: &mut FkCache,
+    client: &JellyfinClient,
+    item: &JellyfinItem,
+    movie_id: i64,
+) -> Result<()> {
+    let file_id = cache.next_file;
+    cache.next_file += 1;
+    let filename = format!("plugin://plugin.video.jellykodi/?mode=play&id={}", item.id);
+    let (play_count, last_played, pos) = userdata(item);
+    let duration = item.runtime_ticks.unwrap_or(0) / 10_000_000;
+    let mut stmt = tx.prepare_cached(
+        "INSERT INTO files (idFile, idPath, strFilename, playCount, lastPlayed, dateAdded) VALUES (?1,?2,?3,?4,?5,?6)",
+    )?;
+    stmt.execute(params![
+        file_id,
+        cache.movie_path_id,
+        filename,
+        play_count,
+        last_played,
+        item.premiered.as_deref().unwrap_or("")
+    ])?;
+    let mut stmt = tx.prepare_cached(
+        "INSERT INTO videoversion (idFile, idMedia, media_type, itemType, idType) VALUES (?1,?2,'movie',?3,?4)",
+    )?;
+    stmt.execute(params![file_id, movie_id, VIDEO_ASSET_TYPE_VERSION, VIDEO_VERSION_ID_DEFAULT])?;
+    if let Some(ref streams) = item.media_streams {
+        insert_streamdetails(tx, file_id, streams, duration)?;
+    }
+    if pos > 0 && duration > 0 {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO bookmark (idFile, timeInSeconds, totalTimeInSeconds, player, type) VALUES (?1,?2,?3,'VideoPlayer',1)",
+        )?;
+        stmt.execute(params![file_id, pos as f64, duration as f64])?;
+    }
+    let _ = client;
+    remember(cache, &item.id, "movieversion", movie_id, file_id);
+    Ok(())
+}
+
+pub fn set_movie_collection(conn: &Connection, movie_id: i64, set_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE movie SET idSet=?1 WHERE idMovie=?2",
+        params![set_id, movie_id],
+    )?;
     Ok(())
 }
 
@@ -657,6 +1105,198 @@ pub fn swap_into_place(staging: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct MappedRow {
+    pub kind: String,
+    pub kodi_id: i64,
+    pub file_id: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalHit {
+    pub jellyfin_id: String,
+    pub kind: String,
+    pub title: String,
+    pub year: i32,
+    pub plot: String,
+}
+
+pub fn hydrate_parents(cache: &mut FkCache, map_path: &Path) -> Result<()> {
+    if !map_path.exists() {
+        return Ok(());
+    }
+    let conn = Connection::open(map_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT jellyfin_id, kind, kodi_id FROM map WHERE kind IN ('movie','tvshow','season')",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, kind, kodi_id) = row?;
+        match kind.as_str() {
+            "movie" => {
+                cache.movies.insert(id, kodi_id);
+            }
+            "tvshow" => {
+                cache.shows.insert(id, kodi_id);
+            }
+            "season" => {
+                cache.seasons.insert(id, kodi_id);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+pub fn insert_live_items(
+    videos: &Path,
+    map_path: &Path,
+    client: &JellyfinClient,
+    items: &[JellyfinItem],
+    cast_limit: usize,
+) -> Result<()> {
+    if items.is_empty() || !videos.exists() {
+        return Ok(());
+    }
+    let mut conn = Connection::open(videos)?;
+    conn.busy_timeout(std::time::Duration::from_secs(8))?;
+    let mut cache = FkCache::resume(&conn)?;
+    hydrate_parents(&mut cache, map_path)?;
+    bulk_insert_items(&mut conn, &mut cache, client, items, cast_limit)?;
+    MapDb::upsert_rows(map_path, &cache.take_map())?;
+    Ok(())
+}
+
+pub fn delete_mapped(videos: &Path, map_path: &Path, jellyfin_id: &str) -> Result<()> {
+    let Some(row) = MapDb::lookup(map_path, jellyfin_id)? else {
+        return Ok(());
+    };
+    if videos.exists() {
+        let conn = Connection::open(videos)?;
+        conn.busy_timeout(std::time::Duration::from_secs(8))?;
+        match row.kind.as_str() {
+            "movie" => {
+                conn.execute("DELETE FROM movie WHERE idMovie=?1", params![row.kodi_id])?;
+            }
+            "episode" => {
+                conn.execute("DELETE FROM episode WHERE idEpisode=?1", params![row.kodi_id])?;
+            }
+            "tvshow" => {
+                conn.execute("DELETE FROM tvshow WHERE idShow=?1", params![row.kodi_id])?;
+            }
+            "season" => {
+                conn.execute("DELETE FROM seasons WHERE idSeason=?1", params![row.kodi_id])?;
+            }
+            "set" => {
+                conn.execute("DELETE FROM sets WHERE idSet=?1", params![row.kodi_id])?;
+            }
+            _ => {}
+        }
+        if row.file_id > 0 {
+            conn.execute("DELETE FROM files WHERE idFile=?1", params![row.file_id])?;
+            conn.execute("DELETE FROM videoversion WHERE idFile=?1", params![row.file_id])?;
+            conn.execute("DELETE FROM streamdetails WHERE idFile=?1", params![row.file_id])?;
+            conn.execute("DELETE FROM bookmark WHERE idFile=?1", params![row.file_id])?;
+        }
+    }
+    MapDb::remove(map_path, jellyfin_id)?;
+    Ok(())
+}
+
+pub fn apply_playback(
+    videos: &Path,
+    map_path: &Path,
+    jellyfin_id: &str,
+    pos_secs: f64,
+    duration_secs: f64,
+) -> Result<()> {
+    let Some(row) = MapDb::lookup(map_path, jellyfin_id)? else {
+        return Ok(());
+    };
+    if row.file_id <= 0 || !videos.exists() {
+        return Ok(());
+    }
+    let conn = Connection::open(videos)?;
+    conn.busy_timeout(std::time::Duration::from_secs(8))?;
+    let played = duration_secs > 0.0 && pos_secs / duration_secs >= 0.90;
+    if played {
+        conn.execute(
+            "UPDATE files SET playCount = COALESCE(playCount,0)+1, lastPlayed = datetime('now') WHERE idFile=?1",
+            params![row.file_id],
+        )?;
+        conn.execute(
+            "DELETE FROM bookmark WHERE idFile=?1 AND type=1",
+            params![row.file_id],
+        )?;
+    } else if pos_secs > 0.0 {
+        conn.execute(
+            "UPDATE files SET lastPlayed = datetime('now') WHERE idFile=?1",
+            params![row.file_id],
+        )?;
+        conn.execute(
+            "DELETE FROM bookmark WHERE idFile=?1 AND type=1",
+            params![row.file_id],
+        )?;
+        conn.execute(
+            "INSERT INTO bookmark (idFile, timeInSeconds, totalTimeInSeconds, player, type) VALUES (?1,?2,?3,'VideoPlayer',1)",
+            params![row.file_id, pos_secs, duration_secs],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn search_local(videos: &Path, map_path: &Path, term: &str, limit: i64) -> Result<Vec<LocalHit>> {
+    if term.trim().is_empty() || !videos.exists() || !map_path.exists() {
+        return Ok(Vec::new());
+    }
+    let like = format!("%{}%", escape_like(term.trim()));
+    let conn = Connection::open(videos)?;
+    conn.execute("ATTACH DATABASE ?1 AS jkmap", params![map_path.to_string_lossy()])?;
+    let mut stmt = conn.prepare(
+        "SELECT jellyfin_id, kind, title, year, plot FROM (
+            SELECT m.jellyfin_id AS jellyfin_id, 'movie' AS kind, mo.c00 AS title,
+                   CAST(mo.c07 AS INTEGER) AS year, mo.c01 AS plot
+            FROM movie mo
+            JOIN jkmap.map m ON m.kind='movie' AND m.kodi_id = mo.idMovie
+            WHERE mo.c00 LIKE ?1 ESCAPE '\\'
+            UNION ALL
+            SELECT m.jellyfin_id, 'tvshow', tv.c00, 0, tv.c01
+            FROM tvshow tv
+            JOIN jkmap.map m ON m.kind='tvshow' AND m.kodi_id = tv.idShow
+            WHERE tv.c00 LIKE ?1 ESCAPE '\\'
+            UNION ALL
+            SELECT m.jellyfin_id, 'episode', ep.c00, 0, ep.c01
+            FROM episode ep
+            JOIN jkmap.map m ON m.kind='episode' AND m.kodi_id = ep.idEpisode
+            WHERE ep.c00 LIKE ?1 ESCAPE '\\'
+         ) LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![like, limit], |r| {
+        Ok(LocalHit {
+            jellyfin_id: r.get(0)?,
+            kind: r.get(1)?,
+            title: r.get(2)?,
+            year: r.get(3)?,
+            plot: r.get(4)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn escape_like(term: &str) -> String {
+    term.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
 pub struct MapDb;
 
 impl MapDb {
@@ -681,23 +1321,96 @@ impl MapDb {
         Ok(n as u64)
     }
 
-    pub fn rebuild_from_pass(path: &Path, count: u64) -> Result<()> {
+    pub fn rebuild_from_pass(path: &Path, count: u64, rows: &[MapEntry]) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS map (jellyfin_id TEXT PRIMARY KEY, kind TEXT);
+            "DROP TABLE IF EXISTS map;
+             CREATE TABLE map (
+               jellyfin_id TEXT PRIMARY KEY,
+               kind TEXT NOT NULL,
+               kodi_id INTEGER NOT NULL,
+               file_id INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);",
         )?;
-        conn.execute(
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO map (jellyfin_id, kind, kodi_id, file_id) VALUES (?1,?2,?3,?4)",
+            )?;
+            for row in rows {
+                stmt.execute(params![row.jellyfin_id, row.kind, row.kodi_id, row.file_id])?;
+            }
+        }
+        tx.execute(
             "INSERT OR REPLACE INTO meta (k,v) VALUES ('last_count', ?1)",
             params![count.to_string()],
         )?;
-        conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO meta (k,v) VALUES ('last_full_sync', ?1)",
             params![chrono::Utc::now().to_rfc3339()],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn lookup(path: &Path, jellyfin_id: &str) -> Result<Option<MappedRow>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(path)?;
+        let mut stmt = conn.prepare(
+            "SELECT kind, kodi_id, file_id FROM map WHERE jellyfin_id=?1",
+        )?;
+        let mut rows = stmt.query(params![jellyfin_id])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(MappedRow {
+                kind: row.get(0)?,
+                kodi_id: row.get(1)?,
+                file_id: row.get(2)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn upsert_rows(path: &Path, rows: &[MapEntry]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut conn = Connection::open(path)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS map (
+               jellyfin_id TEXT PRIMARY KEY,
+               kind TEXT NOT NULL,
+               kodi_id INTEGER NOT NULL,
+               file_id INTEGER NOT NULL
+             );",
+        )?;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO map (jellyfin_id, kind, kodi_id, file_id) VALUES (?1,?2,?3,?4)",
+            )?;
+            for row in rows {
+                stmt.execute(params![row.jellyfin_id, row.kind, row.kodi_id, row.file_id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn remove(path: &Path, jellyfin_id: &str) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let conn = Connection::open(path)?;
+        conn.execute("DELETE FROM map WHERE jellyfin_id=?1", params![jellyfin_id])?;
         Ok(())
     }
 }
@@ -782,6 +1495,7 @@ mod tests {
                 },
             ]),
             primary_version_id: None,
+            ..Default::default()
         };
 
         bulk_insert_items(&mut conn, &mut cache, &client, &[item], 15).unwrap();
@@ -811,6 +1525,29 @@ mod tests {
             .unwrap();
         assert_eq!(a_codec, "truehd");
         assert_eq!(a_channels, 8);
+
+        let genre: String = conn
+            .query_row(
+                "SELECT g.name FROM genre g JOIN genre_link l ON l.genre_id = g.genre_id WHERE l.media_type='movie'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(genre, "Action");
+        let outline: String = conn
+            .query_row("SELECT c02 FROM movie", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(outline, "Plot");
+
+        let map_path = temp.path().join("map.db");
+        let rows = cache.take_map();
+        MapDb::rebuild_from_pass(&map_path, 1, &rows).unwrap();
+        finalize_staging_db(&mut conn).unwrap();
+        drop(conn);
+        let hits = search_local(&db_path, &map_path, "Test Movie", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].jellyfin_id, "m1");
+        assert_eq!(hits[0].kind, "movie");
     }
 
     #[test]
@@ -849,6 +1586,7 @@ mod tests {
             media_sources: None,
             media_streams: None,
             primary_version_id: None,
+            ..Default::default()
         };
 
         // 2. Pass 2: Season 1 arrives pointing to UHD series ID
@@ -877,6 +1615,7 @@ mod tests {
             media_sources: None,
             media_streams: None,
             primary_version_id: None,
+            ..Default::default()
         };
 
         // Season 4 arrives pointing to HD series ID (alternate library ID suppressed in Pass 1)
@@ -905,6 +1644,7 @@ mod tests {
             media_sources: None,
             media_streams: None,
             primary_version_id: None,
+            ..Default::default()
         };
 
         // 3. Pass 3: Season 4 episode arrives pointing to HD series ID and season_4_id
@@ -933,6 +1673,7 @@ mod tests {
             media_sources: None,
             media_streams: None,
             primary_version_id: None,
+            ..Default::default()
         };
 
         bulk_insert_items(

@@ -69,6 +69,10 @@ async fn main() {
 
     let state = AppState::new();
     state.set_online(true);
+    *state.library_paths.write().await = Some(crate::state::LibraryPaths {
+        kodi_db_dir: cfg.kodi_db_dir.clone(),
+        map_db_path: cfg.map_db_path.clone(),
+    });
 
     let sock = cfg.socket_path.clone();
     let ipc_client = client.clone();

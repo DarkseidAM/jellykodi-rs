@@ -59,6 +59,7 @@ jobs:
           cp plugin.video.jellykodi/addon.xml "$ADDON/"
           cp plugin.video.jellykodi/default.py "$ADDON/"
           cp plugin.video.jellykodi/service.py "$ADDON/"
+          cp plugin.video.jellykodi/context.py "$ADDON/"
           cp plugin.video.jellykodi/resources/settings.xml "$ADDON/resources/"
           cp plugin.video.jellykodi/resources/language/resource.language.en_gb/strings.po \
             "$ADDON/resources/language/resource.language.en_gb/"
