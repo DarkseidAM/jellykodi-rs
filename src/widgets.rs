@@ -273,14 +273,18 @@ pub async fn search_items(
 ) -> Result<Vec<KodiWidgetItem>> {
     if let Some(paths) = state.library_paths.read().await.clone() {
         let term_owned = term.to_string();
-        let hits = tokio::task::spawn_blocking(move || {
+        let local = tokio::task::spawn_blocking(move || {
             let videos = crate::sync::find_or_create_myvideos_path(&paths.kodi_db_dir)?;
             crate::sync::schema::search_local(&videos, &paths.map_db_path, &term_owned, 40)
         })
         .await
-        .map_err(|e| crate::error::JellyError::Other(format!("search join: {e}")))??;
-        if !hits.is_empty() {
-            return Ok(hits.into_iter().map(|h| local_to_widget(client, h)).collect());
+        .map_err(|e| crate::error::JellyError::Other(format!("search join: {e}")))?;
+        match local {
+            Ok(hits) if !hits.is_empty() => {
+                return Ok(hits.into_iter().map(|h| local_to_widget(client, h)).collect());
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("local search unavailable, using Jellyfin: {e}"),
         }
     }
     let env = client

@@ -277,7 +277,7 @@ async fn sync_pass(
     let include = include_types.to_string();
     let fields_s = fields.to_string();
 
-    stream::iter(offsets)
+    let fetched = stream::iter(offsets)
         .map(|offset| {
             let c = client_f.clone();
             let inc = include.clone();
@@ -309,12 +309,17 @@ async fn sync_pass(
                 Ok(())
             }
         })
-        .await?;
+        .await;
 
     drop(tx);
-    let (conn, cache, written) = writer
+    let joined = writer
         .await
-        .map_err(|e| JellyError::Other(format!("writer join: {e}")))??;
+        .map_err(|e| JellyError::Other(format!("writer join: {e}")))?;
+    if let Err(write_err) = &joined {
+        warn!(pass = pass_name, "sqlite writer failed: {write_err}");
+    }
+    fetched?;
+    let (conn, cache, written) = joined?;
 
     info!(
         pass = pass_name,

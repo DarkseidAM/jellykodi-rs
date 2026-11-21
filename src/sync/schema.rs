@@ -769,8 +769,15 @@ fn actor_id(tx: &rusqlite::Transaction<'_>, cache: &mut FkCache, name: &str) -> 
     }
     let id = cache.next_actor;
     cache.next_actor += 1;
-    let mut stmt = tx.prepare_cached("INSERT INTO actor (actor_id, name) VALUES (?1,?2)")?;
-    stmt.execute(params![id, name])?;
+    let changed = tx.execute(
+        "INSERT OR IGNORE INTO actor (actor_id, name) VALUES (?1,?2)",
+        params![id, name],
+    )?;
+    let id = if changed == 0 {
+        tx.query_row("SELECT actor_id FROM actor WHERE name=?1", params![name], |r| r.get(0))?
+    } else {
+        id
+    };
     cache.actors.insert(name.to_string(), id);
     Ok(id)
 }
@@ -793,7 +800,7 @@ fn link_crew(
         };
         let id = actor_id(tx, cache, &person.name)?;
         let sql = format!(
-            "INSERT INTO {table} (actor_id, media_id, media_type) VALUES (?1,?2,?3)"
+            "INSERT OR IGNORE INTO {table} (actor_id, media_id, media_type) VALUES (?1,?2,?3)"
         );
         let mut stmt = tx.prepare_cached(&sql)?;
         stmt.execute(params![id, media_id, media_type])?;
@@ -819,7 +826,7 @@ fn link_names(
         }
         let id = named_id(tx, cache, table, id_col, name)?;
         let sql = format!(
-            "INSERT INTO {link_table} ({id_col}, media_id, media_type) VALUES (?1,?2,?3)"
+            "INSERT OR IGNORE INTO {link_table} ({id_col}, media_id, media_type) VALUES (?1,?2,?3)"
         );
         let mut stmt = tx.prepare_cached(&sql)?;
         stmt.execute(params![id, media_id, media_type])?;
@@ -861,9 +868,14 @@ fn named_id(
         }
         _ => return Ok(0),
     };
-    let sql = format!("INSERT INTO {table} ({id_col}, name) VALUES (?1,?2)");
-    let mut stmt = tx.prepare_cached(&sql)?;
-    stmt.execute(params![id, name])?;
+    let sql = format!("INSERT OR IGNORE INTO {table} ({id_col}, name) VALUES (?1,?2)");
+    let changed = tx.execute(&sql, params![id, name])?;
+    let id = if changed == 0 {
+        let lookup = format!("SELECT {id_col} FROM {table} WHERE name=?1");
+        tx.query_row(&lookup, params![name], |r| r.get(0))?
+    } else {
+        id
+    };
     match table {
         "genre" => {
             cache.genres.insert(name.to_string(), id);
@@ -899,13 +911,24 @@ fn link_named_rows(
         } else {
             let id = cache.next_studio;
             cache.next_studio += 1;
-            let mut stmt = tx.prepare_cached("INSERT INTO studio (studio_id, name) VALUES (?1,?2)")?;
-            stmt.execute(params![id, name])?;
+            let changed = tx.execute(
+                "INSERT OR IGNORE INTO studio (studio_id, name) VALUES (?1,?2)",
+                params![id, name],
+            )?;
+            let id = if changed == 0 {
+                tx.query_row(
+                    "SELECT studio_id FROM studio WHERE name=?1",
+                    params![name],
+                    |r| r.get(0),
+                )?
+            } else {
+                id
+            };
             cache.studios.insert(name.to_string(), id);
             id
         };
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO studio_link (studio_id, media_id, media_type) VALUES (?1,?2,?3)",
+            "INSERT OR IGNORE INTO studio_link (studio_id, media_id, media_type) VALUES (?1,?2,?3)",
         )?;
         stmt.execute(params![id, media_id, media_type])?;
     }
@@ -1014,13 +1037,24 @@ fn insert_cast(
         } else {
             let id = cache.next_actor;
             cache.next_actor += 1;
-            let mut stmt = tx.prepare_cached("INSERT INTO actor (actor_id, name) VALUES (?1,?2)")?;
-            stmt.execute(params![id, &person.name])?;
+            let changed = tx.execute(
+                "INSERT OR IGNORE INTO actor (actor_id, name) VALUES (?1,?2)",
+                params![id, &person.name],
+            )?;
+            let id = if changed == 0 {
+                tx.query_row(
+                    "SELECT actor_id FROM actor WHERE name=?1",
+                    params![&person.name],
+                    |r| r.get(0),
+                )?
+            } else {
+                id
+            };
             cache.actors.insert(person.name.clone(), id);
             id
         };
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO actor_link (actor_id, media_id, media_type, role, cast_order) VALUES (?1,?2,?3,?4,?5)",
+            "INSERT OR IGNORE INTO actor_link (actor_id, media_id, media_type, role, cast_order) VALUES (?1,?2,?3,?4,?5)",
         )?;
         stmt.execute(params![
             actor_id,
@@ -1252,7 +1286,7 @@ pub fn apply_playback(
 }
 
 pub fn search_local(videos: &Path, map_path: &Path, term: &str, limit: i64) -> Result<Vec<LocalHit>> {
-    if term.trim().is_empty() || !videos.exists() || !map_path.exists() {
+    if term.trim().is_empty() || !videos.exists() || !map_path.exists() || !map_has_kodi_id(map_path)? {
         return Ok(Vec::new());
     }
     let like = format!("%{}%", escape_like(term.trim()));
@@ -1291,6 +1325,18 @@ pub fn search_local(videos: &Path, map_path: &Path, term: &str, limit: i64) -> R
         out.push(row?);
     }
     Ok(out)
+}
+
+fn map_has_kodi_id(path: &Path) -> Result<bool> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare("PRAGMA table_info(map)")?;
+    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for col in cols {
+        if col? == "kodi_id" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn escape_like(term: &str) -> String {
@@ -1548,6 +1594,17 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].jellyfin_id, "m1");
         assert_eq!(hits[0].kind, "movie");
+
+        let old_map = temp.path().join("old_map.db");
+        let old = Connection::open(&old_map).unwrap();
+        old.execute_batch(
+            "CREATE TABLE map (jellyfin_id TEXT PRIMARY KEY, kind TEXT);
+             INSERT INTO map (jellyfin_id, kind) VALUES ('m1','movie');",
+        )
+        .unwrap();
+        drop(old);
+        let legacy = search_local(&db_path, &old_map, "Test Movie", 10).unwrap();
+        assert!(legacy.is_empty());
     }
 
     #[test]
