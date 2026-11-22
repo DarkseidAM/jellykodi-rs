@@ -35,5 +35,6 @@ __pycache__/
 *.pyc
 
 plugin.video.jellykodi-*.zip
+plugin.video.jellykodi/bin/
 /target/
 reference/

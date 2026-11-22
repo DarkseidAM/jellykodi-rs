@@ -96,7 +96,7 @@ pub async fn refresh_all_widgets(client: &JellyfinClient, state: &Arc<AppState>)
         refresh_latest(client, "Episode", "episode"),
         refresh_filtered(client, "Movie", "IsFavorite", "SortName", "Ascending", "movie"),
         refresh_filtered(client, "Series", "IsFavorite", "SortName", "Ascending", "tvshow"),
-        refresh_filtered(client, "BoxSet", "", "SortName", "Ascending", "set"),
+        refresh_boxsets(client),
         refresh_filtered(client, "BoxSet", "IsFavorite", "SortName", "Ascending", "set"),
     )?;
 
@@ -244,6 +244,29 @@ async fn refresh_latest(
         .collect())
 }
 
+/// Every BoxSet, not the 40-item widget page used for movies and shows.
+async fn refresh_boxsets(client: &JellyfinClient) -> Result<Vec<KodiWidgetItem>> {
+    const PAGE: u32 = 200;
+    let mut start = 0u32;
+    let mut out = Vec::new();
+    loop {
+        let env = client
+            .items_filtered("BoxSet", "", "SortName", "Ascending", PAGE, start, WIDGET_FIELDS)
+            .await?;
+        let n = env.items.len() as u32;
+        out.extend(env.items.into_iter().map(|it| {
+            let mut w = to_widget(client, &it);
+            w.media_type = "set".into();
+            w
+        }));
+        if n < PAGE || start >= 10_000 {
+            break;
+        }
+        start += PAGE;
+    }
+    Ok(out)
+}
+
 async fn refresh_filtered(
     client: &JellyfinClient,
     include: &str,
@@ -253,7 +276,7 @@ async fn refresh_filtered(
     media_type: &str,
 ) -> Result<Vec<KodiWidgetItem>> {
     let env = client
-        .items_filtered(include, filters, sort_by, sort_order, 40, WIDGET_FIELDS)
+        .items_filtered(include, filters, sort_by, sort_order, 40, 0, WIDGET_FIELDS)
         .await?;
     Ok(env
         .items
@@ -588,6 +611,7 @@ mod tests {
             index_number: None,
             provider_ids: None,
             media_sources: None,
+            media_source_count: None,
             media_streams: None,
             primary_version_id: None,
             ..Default::default()

@@ -21,7 +21,7 @@ def _item_id(path: str) -> str:
     return params.get("id", "")
 
 
-def _ipc(command: str) -> None:
+def _ipc(command: str) -> dict:
     addon = xbmcaddon_addon()
     profile = xbmcvfs.translatePath(addon.getAddonInfo("profile"))
     sock_path = os.path.join(profile, "jellykodi.sock")
@@ -29,10 +29,11 @@ def _ipc(command: str) -> None:
         s.settimeout(8.0)
         s.connect(sock_path)
         s.sendall(command.encode("utf-8") + b"\n")
-        raw = s.recv(4096)
+        raw = s.recv(65536)
     payload = json.loads(raw.decode("utf-8").strip() or "{}")
     if payload.get("error"):
         raise RuntimeError(payload["error"])
+    return payload
 
 
 def xbmcaddon_addon():
@@ -54,12 +55,24 @@ def main() -> None:
     item_id = _item_id(path)
     if not item_id:
         return
-    choice = xbmcgui.Dialog().select("JellyKodi", ["Mark watched", "Add favorite"])
+    choice = xbmcgui.Dialog().select("JellyKodi", ["Play version...", "Mark watched", "Add favorite"])
     try:
         if choice == 0:
+            play = _ipc(f"PLAY {item_id}")
+            avail = play.get("available_sources") or []
+            if len(avail) <= 1:
+                xbmcgui.Dialog().notification("JellyKodi", "Only 1 version available", xbmcgui.NOTIFICATION_INFO, 2500)
+                return
+            labels = [s.get("name") or s.get("id") or "Version" for s in avail]
+            v_choice = xbmcgui.Dialog().select("Choose Version", labels)
+            if v_choice < 0:
+                return
+            chosen_source = avail[v_choice].get("id")
+            xbmc.Player().play(f"plugin://plugin.video.jellykodi/?mode=play&id={item_id}&source={chosen_source}")
+        elif choice == 1:
             _ipc(f"PLAYED {item_id}")
             xbmcgui.Dialog().notification("JellyKodi", "Marked watched", xbmcgui.NOTIFICATION_INFO, 2500)
-        elif choice == 1:
+        elif choice == 2:
             _ipc(f"FAVORITE {item_id}")
             xbmcgui.Dialog().notification("JellyKodi", "Favorite updated", xbmcgui.NOTIFICATION_INFO, 2500)
     except Exception as exc:

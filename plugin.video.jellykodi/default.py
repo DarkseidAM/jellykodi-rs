@@ -309,7 +309,11 @@ def resolve_play(item_id: str) -> None:
         xbmcplugin.setResolvedUrl(HANDLE, False, xbmcgui.ListItem())
         return
     try:
-        play = ipc_call(f"PLAY {item_id}", timeout=30.0, wait_daemon=10.0)
+        source = ""
+        if len(sys.argv) > 2:
+            source = dict(parse_qsl(sys.argv[2].lstrip("?"))).get("source", "")
+        play_cmd = f"PLAY {item_id} {source}".strip()
+        play = ipc_call(play_cmd, timeout=30.0, wait_daemon=10.0)
     except (OSError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
         try:
             xbmcgui.Dialog().notification(
@@ -330,6 +334,24 @@ def resolve_play(item_id: str) -> None:
             pass
         xbmcplugin.setResolvedUrl(HANDLE, False, xbmcgui.ListItem())
         return
+
+    # If source was not explicitly passed in URL and multiple versions exist, prompt user:
+    avail = play.get("available_sources") or []
+    if not source and len(avail) > 1 and ADDON.getSetting("version_prompt") != "false":
+        labels = [s.get("name") or s.get("id") or "Version" for s in avail]
+        choice = xbmcgui.Dialog().select("Choose Version", labels)
+        if choice < 0:
+            xbmcplugin.setResolvedUrl(HANDLE, False, xbmcgui.ListItem())
+            return
+        selected = avail[choice]
+        if selected.get("stream_url"):
+            play["stream_url"] = selected["stream_url"]
+        if selected.get("id"):
+            play["media_source_id"] = selected["id"]
+        if "subtitles" in selected:
+            play["subtitles"] = selected["subtitles"]
+        if "streams" in selected:
+            play["streams"] = selected["streams"]
 
     resume_pos = int(play.get("resume_pos_secs") or 0)
     duration = int(play.get("duration_secs") or 0)

@@ -62,6 +62,10 @@ msgctxt "#32023"
 msgid "Ask before resuming"
 msgstr "Ask before resuming"
 
+msgctxt "#32024"
+msgid "Ask to select version"
+msgstr "Ask to select version"
+
 msgctxt "#32040"
 msgid "JellyKodi actions"
 msgstr "JellyKodi actions"

@@ -149,7 +149,7 @@ impl JellyfinClient {
     /// Paginated library items (Movie/Series/Season/Episode/BoxSet).
     /// Only page 0 requests `TotalRecordCount` (avoids a full-table COUNT on every page).
     pub async fn get_item(&self, item_id: &str) -> Result<JellyfinItem> {
-        let fields = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Genres,Studios,People,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear,MediaStreams,Tagline,Tags,ProductionLocations,RemoteTrailers,SortName,Status,ImageTags,VoteCount";
+        let fields = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Genres,Studios,People,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear,MediaStreams,MediaSources,MediaSourceCount,Tagline,Tags,ProductionLocations,RemoteTrailers,SortName,Status,ImageTags,VoteCount";
         let q = format!(
             "/Users/{}/Items/{}?Fields={}",
             self.user_id,
@@ -298,6 +298,7 @@ impl JellyfinClient {
     }
 
     /// Filtered library query (IsResumable / IsFavorite / BoxSet lists for widgets).
+    #[allow(clippy::too_many_arguments)]
     pub async fn items_filtered(
         &self,
         include_types: &str,
@@ -305,12 +306,14 @@ impl JellyfinClient {
         sort_by: &str,
         sort_order: &str,
         limit: u32,
+        start_index: u32,
         fields: &str,
     ) -> Result<ItemsEnvelope> {
         let mut q = format!(
-            "/Users/{}/Items?Recursive=true&IncludeItemTypes={}&Limit={}&Fields={}&EnableTotalRecordCount=false&IsMissing=false",
+            "/Users/{}/Items?Recursive=true&IncludeItemTypes={}&StartIndex={}&Limit={}&Fields={}&EnableTotalRecordCount=false&IsMissing=false",
             self.user_id,
             urlencoding(include_types),
+            start_index,
             limit,
             urlencoding(fields),
         );
@@ -382,6 +385,17 @@ impl JellyfinClient {
             urlencoding(fields),
         );
         self.get_json(&q).await
+    }
+
+    /// Media sources for one item. Library lists omit them even when MediaSourceCount > 1.
+    pub async fn item_media_sources(&self, item_id: &str) -> Result<Vec<crate::jellyfin::types::MediaSource>> {
+        let q = format!(
+            "/Users/{}/Items/{}?Fields=MediaSources",
+            self.user_id,
+            urlencoding(item_id)
+        );
+        let item: crate::jellyfin::types::JellyfinItem = self.get_json(&q).await?;
+        Ok(item.media_sources.unwrap_or_default())
     }
 
     pub async fn playback_info(&self, item_id: &str) -> Result<PlaybackInfoResponse> {

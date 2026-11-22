@@ -27,6 +27,15 @@ pub struct PlaybackStreams {
     pub subtitle: Vec<KodiSubtitleStream>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceOption {
+    pub id: String,
+    pub name: String,
+    pub stream_url: String,
+    pub subtitles: Vec<SubtitleTrackInfo>,
+    pub streams: PlaybackStreams,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PlayResolve {
     pub stream_url: String,
@@ -45,12 +54,14 @@ pub struct PlayResolve {
     pub intro_start_secs: i64,
     pub intro_end_secs: i64,
     pub series_id: String,
+    pub available_sources: Vec<SourceOption>,
 }
 
 pub async fn resolve_play(
     client: &JellyfinClient,
     state: Option<&std::sync::Arc<crate::state::AppState>>,
     item_id: &str,
+    source_id: Option<&str>,
 ) -> Result<PlayResolve> {
     let (info_res, item_res, intro_res) = tokio::join!(
         client.playback_info(item_id),
@@ -64,7 +75,7 @@ pub async fn resolve_play(
 
     let play_session_id = info.play_session_id.unwrap_or_default();
 
-    let source = pick_best_source(&info.media_sources)
+    let source = pick_source(&info.media_sources, source_id)
         .ok_or_else(|| JellyError::Api("PlaybackInfo returned no MediaSources".into()))?;
 
     let (stream_url, play_method) = stream_url_for(client, item_id, source)?;
@@ -111,6 +122,31 @@ pub async fn resolve_play(
         .and_then(|i| i.series_id.clone())
         .unwrap_or_default();
 
+    let mut available_sources: Vec<SourceOption> = info
+        .media_sources
+        .iter()
+        .filter_map(|s| {
+            let (url, _) = stream_url_for(client, item_id, s).ok()?;
+            let subs = external_subs(client, item_id, s);
+            let strms = extract_playback_streams(s.media_streams.as_deref().unwrap_or(&[]));
+            let name = s.version_label();
+            Some(SourceOption {
+                id: s.id.clone(),
+                name,
+                stream_url: url,
+                subtitles: subs,
+                streams: strms,
+            })
+        })
+        .collect();
+
+    available_sources.sort_by_key(|s| {
+        let ms = info.media_sources.iter().find(|m| m.id == s.id);
+        let h = ms.map(|m| m.source_height()).unwrap_or(0);
+        let br = ms.and_then(|m| m.bitrate).unwrap_or(0);
+        std::cmp::Reverse((h, br))
+    });
+
     Ok(PlayResolve {
         stream_url,
         subtitles,
@@ -128,22 +164,24 @@ pub async fn resolve_play(
         intro_start_secs,
         intro_end_secs,
         series_id,
+        available_sources,
     })
+}
+
+/// Use the version Kodi selected. Otherwise the highest-resolution direct source.
+fn pick_source<'a>(sources: &'a [MediaSource], source_id: Option<&str>) -> Option<&'a MediaSource> {
+    if let Some(id) = source_id.map(str::trim).filter(|id| !id.is_empty())
+        && let Some(source) = sources.iter().find(|s| s.id.eq_ignore_ascii_case(id))
+    {
+        return Some(source);
+    }
+    pick_best_source(sources)
 }
 
 /// Prefer highest-resolution DirectPlay/DirectStream source (Merge Versions / UHD).
 fn pick_best_source(sources: &[MediaSource]) -> Option<&MediaSource> {
     sources.iter().max_by_key(|s| {
-        let h = s
-            .media_streams
-            .as_ref()
-            .and_then(|ms| {
-                ms.iter()
-                    .filter(|m| m.stream_type == "Video")
-                    .filter_map(|m| m.height)
-                    .max()
-            })
-            .unwrap_or(0);
+        let h = s.source_height();
         let bitrate = s.bitrate.unwrap_or(0);
         let direct = if s.supports_direct_play || s.supports_direct_stream {
             1_i64
@@ -368,6 +406,7 @@ mod tests {
         let client = JellyfinClient::new(&cfg).unwrap();
         let source = MediaSource {
             id: "source1".into(),
+            name: None,
             container: Some("mkv".into()),
             path: None,
             size: None,
@@ -445,5 +484,85 @@ mod tests {
         assert_eq!(subs[0].codec, "subrip");
         assert_eq!(subs[0].language, "fra");
         assert_eq!(subs[0].url, "http://localhost:8096/Videos/item1/source1/Subtitles/3/Stream.srt");
+    }
+
+    #[test]
+    fn pick_source_uses_the_selected_version() {
+        let tall = MediaSource {
+            id: "uhd".into(),
+            media_streams: Some(vec![MediaStream {
+                stream_type: "Video".into(),
+                height: Some(2160),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let short = MediaSource {
+            id: "hd".into(),
+            media_streams: Some(vec![MediaStream {
+                stream_type: "Video".into(),
+                height: Some(1080),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let sources = [tall, short];
+        assert_eq!(pick_source(&sources, Some("HD")).unwrap().id, "hd");
+        assert_eq!(pick_source(&sources, None).unwrap().id, "uhd");
+    }
+
+    #[test]
+    fn version_label_formats_and_cleans_properly() {
+        let s1 = MediaSource {
+            id: "s1".into(),
+            name: Some("2160p HEVC TrueHD Atmos DV HDR10Plus]-CiNEPHiLES".into()),
+            media_streams: Some(vec![MediaStream {
+                stream_type: "Video".into(),
+                height: Some(2160),
+                codec: Some("hevc".into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(s1.version_label(), "2160p HEVC TrueHD Atmos DV HDR10Plus");
+
+        let s2 = MediaSource {
+            id: "s2".into(),
+            name: Some("1080p AVC TrueHD Atmos ]-CiNEPHiLES".into()),
+            media_streams: Some(vec![MediaStream {
+                stream_type: "Video".into(),
+                height: Some(1080),
+                codec: Some("h264".into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(s2.version_label(), "1080p AVC TrueHD Atmos");
+
+        let s3 = MediaSource {
+            id: "s3".into(),
+            name: Some("[WEBDL-2160p x264 AAC ]-AMORT".into()),
+            media_streams: Some(vec![MediaStream {
+                stream_type: "Video".into(),
+                height: Some(2160),
+                codec: Some("h264".into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(s3.version_label(), "WEBDL-2160p x264 AAC");
+
+        let s4 = MediaSource {
+            id: "s4".into(),
+            name: Some("Director's Cut".into()),
+            media_streams: Some(vec![MediaStream {
+                stream_type: "Video".into(),
+                height: Some(1080),
+                codec: Some("hevc".into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(s4.version_label(), "1080p Director's Cut");
     }
 }

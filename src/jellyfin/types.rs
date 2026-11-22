@@ -54,6 +54,9 @@ pub struct JellyfinItem {
     pub provider_ids: Option<serde_json::Value>,
     #[serde(rename = "MediaSources")]
     pub media_sources: Option<Vec<MediaSource>>,
+    /// Set on library lists. Alternate copies are not separate items.
+    #[serde(default, rename = "MediaSourceCount")]
+    pub media_source_count: Option<i32>,
     #[serde(rename = "MediaStreams")]
     pub media_streams: Option<Vec<MediaStream>>,
     /// Primary version id when this item is an alternate (Merge Versions).
@@ -115,10 +118,12 @@ pub struct UserData {
     pub last_played: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct MediaSource {
     #[serde(rename = "Id")]
     pub id: String,
+    #[serde(default, rename = "Name")]
+    pub name: Option<String>,
     #[serde(rename = "Path")]
     pub path: Option<String>,
     #[serde(rename = "Container")]
@@ -139,7 +144,100 @@ pub struct MediaSource {
     pub media_streams: Option<Vec<MediaStream>>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+impl MediaSource {
+    pub fn source_height(&self) -> i32 {
+        self.media_streams
+            .as_ref()
+            .and_then(|streams| {
+                streams
+                    .iter()
+                    .filter(|s| s.stream_type == "Video")
+                    .filter_map(|s| s.height)
+                    .max()
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn normalized_video_codec(&self) -> String {
+        self.media_streams
+            .as_ref()
+            .and_then(|streams| streams.iter().find(|s| s.stream_type == "Video"))
+            .map(|s| s.normalized_video_codec())
+            .unwrap_or_default()
+    }
+
+    pub fn version_label(&self) -> String {
+        let height = self.source_height();
+        let res = if height >= 2000 {
+            "2160p"
+        } else if height >= 1400 {
+            "1440p"
+        } else if height >= 1000 {
+            "1080p"
+        } else if height >= 700 {
+            "720p"
+        } else if height > 0 {
+            "SD"
+        } else {
+            ""
+        };
+        let codec = self.normalized_video_codec();
+        let raw = self
+            .name
+            .as_deref()
+            .filter(|n| !n.trim().is_empty())
+            .or_else(|| {
+                self.path.as_deref().and_then(|p| {
+                    let file = p.rsplit(['/', '\\']).next().unwrap_or(p);
+                    file.strip_suffix(".mkv")
+                        .or_else(|| file.strip_suffix(".mp4"))
+                        .or(Some(file))
+                })
+            })
+            .unwrap_or("");
+
+        let cleaned = clean_version_name(raw);
+        if cleaned.is_empty() {
+            let mut parts = Vec::new();
+            if !res.is_empty() {
+                parts.push(res);
+            }
+            if !codec.is_empty() {
+                parts.push(codec.as_str());
+            }
+            if parts.is_empty() {
+                self.id.chars().take(8).collect()
+            } else {
+                parts.join(" ")
+            }
+        } else {
+            let upper = cleaned.to_uppercase();
+            let has_res = upper.contains("2160")
+                || upper.contains("1080")
+                || upper.contains("720")
+                || upper.contains("4K")
+                || upper.contains("UHD")
+                || upper.contains("FHD")
+                || upper.contains("HD");
+            if has_res || res.is_empty() {
+                cleaned
+            } else {
+                format!("{res} {cleaned}")
+            }
+        }
+    }
+}
+
+pub fn clean_version_name(raw: &str) -> String {
+    let mut s = raw.trim();
+    if let Some(idx) = s.rfind("]-") {
+        s = &s[..idx];
+    }
+    s.trim_matches(|c: char| c == '[' || c == ']' || c == '-' || c == ' ' || c == '.')
+        .to_string()
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct MediaStream {
     #[serde(rename = "Type")]
     pub stream_type: String,

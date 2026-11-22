@@ -77,8 +77,11 @@ async fn dispatch(
         let items = widgets::browse_items(client, id.trim()).await?;
         return Ok(serde_json::to_value(items)?);
     }
-    if let Some(id) = line.strip_prefix("PLAY ") {
-        let play = playback::resolve_play(client, Some(state), id.trim()).await?;
+    if let Some(rest) = line.strip_prefix("PLAY ") {
+        let mut parts = rest.split_whitespace();
+        let id = parts.next().unwrap_or("");
+        let source = parts.next();
+        let play = playback::resolve_play(client, Some(state), id, source).await?;
         return Ok(serde_json::to_value(play)?);
     }
     if let Some(raw) = line.strip_prefix("EVENT ") {

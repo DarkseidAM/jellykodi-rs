@@ -19,8 +19,11 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+/// Full metadata for roots (movies/series/boxsets) including MediaSources so multi-versions are populated.
+const SYNC_FIELDS_ROOTS: &str = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Genres,Studios,People,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear,MediaStreams,MediaSources,MediaSourceCount,Tagline,Tags,ProductionLocations,RemoteTrailers,SortName,Status,ImageTags,BackdropImageTags,VoteCount";
+
 /// Full metadata for movies / series / boxsets (People joins are expensive on episodes).
-const SYNC_FIELDS_FULL: &str = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Genres,Studios,People,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear,MediaStreams,Tagline,Tags,ProductionLocations,RemoteTrailers,SortName,Status,ImageTags,BackdropImageTags,VoteCount";
+const SYNC_FIELDS_FULL: &str = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Genres,Studios,People,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear,MediaStreams,MediaSourceCount,Tagline,Tags,ProductionLocations,RemoteTrailers,SortName,Status,ImageTags,BackdropImageTags,VoteCount";
 
 /// Lean fields for Season/Episode — no People/Studios/Genres (huge JF JOIN cost).
 const SYNC_FIELDS_LEAN: &str = "DateCreated,PremiereDate,CommunityRating,OfficialRating,Overview,ProviderIds,RunTimeTicks,UserData,PrimaryVersionId,ParentId,SeriesId,SeasonId,ParentIndexNumber,IndexNumber,ProductionYear,MediaStreams";
@@ -118,13 +121,13 @@ async fn full_sync_inner(
         cfg.sync_concurrency
     };
 
-    // Pass 1: library roots with full People/Studios/Genres.
+    // Pass 1: library roots with full People/Studios/Genres and MediaSources.
     let (conn, cache, n1) = sync_pass(SyncPass {
         client,
         cfg,
         concurrency,
         include_types: "Movie,Series,BoxSet",
-        fields: SYNC_FIELDS_FULL,
+        fields: SYNC_FIELDS_ROOTS,
         cast_limit: cfg.cast_limit,
         pass_name: "roots",
         conn,
@@ -261,7 +264,7 @@ async fn sync_pass(
     });
 
     // Page 0
-    let first_items = filter_primary_versions(first.items);
+    let first_items = attach_movie_versions(client, filter_primary_versions(first.items)).await;
     if !first_items.is_empty() {
         tx.send(first_items)
             .await
@@ -286,7 +289,7 @@ async fn sync_pass(
                 let t0 = Instant::now();
                 let env = c.items_page(&inc, offset, page, &f).await?;
                 let fetch_ms = t0.elapsed().as_millis() as u64;
-                let items = filter_primary_versions(env.items);
+                let items = attach_movie_versions(&c, filter_primary_versions(env.items)).await;
                 Ok::<_, JellyError>((offset, items, fetch_ms))
             }
         })
@@ -328,6 +331,48 @@ async fn sync_pass(
         "sync pass complete"
     );
     Ok((conn, cache, written))
+}
+
+/// Library queries hide alternate version items. Pull every source onto the primary movie.
+async fn attach_movie_versions(client: &JellyfinClient, mut items: Vec<JellyfinItem>) -> Vec<JellyfinItem> {
+    let ids: Vec<String> = items
+        .iter()
+        .filter(|it| {
+            it.item_type == "Movie"
+                && it.media_source_count.unwrap_or(0) > 1
+                && it.media_sources.as_ref().map_or(0, |s| s.len()) <= 1
+        })
+        .map(|it| it.id.clone())
+        .collect();
+    if ids.is_empty() {
+        return items;
+    }
+    let fetched: Vec<(String, Vec<crate::jellyfin::types::MediaSource>)> = stream::iter(ids)
+        .map(|id| {
+            let client = client.clone();
+            async move {
+                match client.item_media_sources(&id).await {
+                    Ok(sources) => (id, sources),
+                    Err(e) => {
+                        warn!("media sources for {id} failed: {e}");
+                        (id, Vec::new())
+                    }
+                }
+            }
+        })
+        .buffer_unordered(8)
+        .collect()
+        .await;
+    let by_id: std::collections::HashMap<String, Vec<crate::jellyfin::types::MediaSource>> =
+        fetched.into_iter().collect();
+    for item in &mut items {
+        if let Some(sources) = by_id.get(&item.id)
+            && sources.len() > 1
+        {
+            item.media_sources = Some(sources.clone());
+        }
+    }
+    items
 }
 
 /// Keep alternate movie files (stored as extra videoversions). Drop alternate

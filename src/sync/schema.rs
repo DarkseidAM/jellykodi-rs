@@ -216,6 +216,49 @@ pub fn bulk_insert_items(
     Ok(())
 }
 
+fn play_url(item_id: &str, source_id: Option<&str>) -> String {
+    match source_id {
+        Some(source) if !source.is_empty() => {
+            format!("plugin://plugin.video.jellykodi/?mode=play&id={item_id}&source={source}")
+        }
+        _ => format!("plugin://plugin.video.jellykodi/?mode=play&id={item_id}"),
+    }
+}
+
+fn version_type_id_for_label(label: &str) -> i64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in label.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    100_000 + (hash % 800_000_000) as i64
+}
+
+fn ensure_version_type(
+    tx: &rusqlite::Transaction<'_>,
+    source: &crate::jellyfin::types::MediaSource,
+) -> Result<i64> {
+    let label = source.version_label();
+    let id = version_type_id_for_label(&label);
+    tx.execute(
+        "INSERT OR IGNORE INTO videoversiontype (id, name, owner, itemType) VALUES (?1, ?2, 0, ?3)",
+        params![id, label, VIDEO_ASSET_TYPE_VERSION],
+    )?;
+    Ok(id)
+}
+
+fn ensure_custom_version_type(
+    tx: &rusqlite::Transaction<'_>,
+    label: &str,
+) -> Result<i64> {
+    let id = version_type_id_for_label(label);
+    tx.execute(
+        "INSERT OR IGNORE INTO videoversiontype (id, name, owner, itemType) VALUES (?1, ?2, 0, ?3)",
+        params![id, label, VIDEO_ASSET_TYPE_VERSION],
+    )?;
+    Ok(id)
+}
+
 fn insert_movie(
     tx: &rusqlite::Transaction<'_>,
     cache: &mut FkCache,
@@ -237,7 +280,9 @@ fn insert_movie(
     cache.next_file += 1;
     let movie_id = cache.next_movie;
     cache.next_movie += 1;
-    let filename = format!("plugin://plugin.video.jellykodi/?mode=play&id={}", item.id);
+    let sources = item.media_sources.clone().unwrap_or_default();
+    let default_source = sources.iter().max_by_key(|s| (s.source_height(), s.bitrate.unwrap_or(0)));
+    let filename = play_url(&item.id, default_source.filter(|_| sources.len() > 1).map(|s| s.id.as_str()));
     let (play_count, last_played, pos) = userdata(item);
     let duration = item.runtime_ticks.unwrap_or(0) / 10_000_000;
     {
@@ -297,6 +342,14 @@ fn insert_movie(
             item.premiered.as_deref().unwrap_or("")
         ])?;
     }
+    let default_type = if sources.len() > 1 {
+        default_source
+            .map(|s| ensure_version_type(tx, s))
+            .transpose()?
+            .unwrap_or(VIDEO_VERSION_ID_DEFAULT)
+    } else {
+        VIDEO_VERSION_ID_DEFAULT
+    };
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO videoversion (idFile, idMedia, media_type, itemType, idType) VALUES (?1,?2,'movie',?3,?4)",
@@ -305,12 +358,21 @@ fn insert_movie(
             file_id,
             movie_id,
             VIDEO_ASSET_TYPE_VERSION,
-            VIDEO_VERSION_ID_DEFAULT
+            default_type
         ])?;
     }
     insert_art(tx, movie_id, "movie", client, item)?;
-    if let Some(ref streams) = item.media_streams {
+    let default_streams = default_source
+        .and_then(|s| s.media_streams.clone())
+        .or_else(|| item.media_streams.clone());
+    if let Some(ref streams) = default_streams {
         insert_streamdetails(tx, file_id, streams, duration)?;
+    }
+    if sources.len() > 1 {
+        let default_id = default_source.map(|s| s.id.as_str()).unwrap_or("");
+        for source in sources.iter().filter(|s| !s.id.eq_ignore_ascii_case(default_id)) {
+            insert_source_file(tx, cache, &item.id, movie_id, source, duration)?;
+        }
     }
     if pos > 0 && duration > 0 {
         let mut stmt = tx.prepare_cached(
@@ -966,6 +1028,32 @@ fn link_show_meta(
     Ok(())
 }
 
+fn insert_source_file(
+    tx: &rusqlite::Transaction<'_>,
+    cache: &mut FkCache,
+    item_id: &str,
+    movie_id: i64,
+    source: &crate::jellyfin::types::MediaSource,
+    duration: i64,
+) -> Result<()> {
+    let file_id = cache.next_file;
+    cache.next_file += 1;
+    let filename = play_url(item_id, Some(&source.id));
+    let mut stmt = tx.prepare_cached(
+        "INSERT INTO files (idFile, idPath, strFilename, playCount, lastPlayed, dateAdded) VALUES (?1,?2,?3,0,NULL,?4)",
+    )?;
+    stmt.execute(params![file_id, cache.movie_path_id, filename, ""])?;
+    let type_id = ensure_version_type(tx, source)?;
+    let mut stmt = tx.prepare_cached(
+        "INSERT INTO videoversion (idFile, idMedia, media_type, itemType, idType) VALUES (?1,?2,'movie',?3,?4)",
+    )?;
+    stmt.execute(params![file_id, movie_id, VIDEO_ASSET_TYPE_VERSION, type_id])?;
+    if let Some(streams) = source.media_streams.as_ref() {
+        insert_streamdetails(tx, file_id, streams, duration)?;
+    }
+    Ok(())
+}
+
 fn insert_alternate_file(
     tx: &rusqlite::Transaction<'_>,
     cache: &mut FkCache,
@@ -989,10 +1077,17 @@ fn insert_alternate_file(
         last_played,
         item.premiered.as_deref().unwrap_or("")
     ])?;
+    let type_id = if let Some(sources) = &item.media_sources
+        && let Some(first) = sources.first()
+    {
+        ensure_version_type(tx, first)?
+    } else {
+        ensure_custom_version_type(tx, &item.name)?
+    };
     let mut stmt = tx.prepare_cached(
         "INSERT INTO videoversion (idFile, idMedia, media_type, itemType, idType) VALUES (?1,?2,'movie',?3,?4)",
     )?;
-    stmt.execute(params![file_id, movie_id, VIDEO_ASSET_TYPE_VERSION, VIDEO_VERSION_ID_DEFAULT])?;
+    stmt.execute(params![file_id, movie_id, VIDEO_ASSET_TYPE_VERSION, type_id])?;
     if let Some(ref streams) = item.media_streams {
         insert_streamdetails(tx, file_id, streams, duration)?;
     }
@@ -1216,6 +1311,18 @@ pub fn delete_mapped(videos: &Path, map_path: &Path, jellyfin_id: &str) -> Resul
         conn.busy_timeout(std::time::Duration::from_secs(8))?;
         match row.kind.as_str() {
             "movie" => {
+                let mut alt_files = Vec::new();
+                if let Ok(mut stmt) = conn.prepare("SELECT idFile FROM videoversion WHERE idMedia=?1 AND media_type='movie'")
+                    && let Ok(rows) = stmt.query_map(params![row.kodi_id], |r| r.get::<_, i64>(0))
+                {
+                    alt_files.extend(rows.filter_map(|r| r.ok()));
+                }
+                for fid in alt_files {
+                    let _ = conn.execute("DELETE FROM files WHERE idFile=?1", params![fid]);
+                    let _ = conn.execute("DELETE FROM videoversion WHERE idFile=?1", params![fid]);
+                    let _ = conn.execute("DELETE FROM streamdetails WHERE idFile=?1", params![fid]);
+                    let _ = conn.execute("DELETE FROM bookmark WHERE idFile=?1", params![fid]);
+                }
                 conn.execute("DELETE FROM movie WHERE idMovie=?1", params![row.kodi_id])?;
             }
             "episode" => {
@@ -1465,7 +1572,7 @@ impl MapDb {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::jellyfin::types::MediaStream;
+    use crate::jellyfin::types::{MediaSource, MediaStream};
 
     #[test]
     fn insert_movie_populates_streamdetails() {
@@ -1500,6 +1607,7 @@ mod tests {
             index_number: None,
             provider_ids: None,
             media_sources: None,
+            media_source_count: None,
             media_streams: Some(vec![
                 MediaStream {
                     stream_type: "Video".into(),
@@ -1608,6 +1716,115 @@ mod tests {
     }
 
     #[test]
+    fn insert_movie_writes_one_version_per_media_source() {
+        use crate::jellyfin::types::{MediaSource, MediaStream};
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("versions.db");
+        let mut conn = open_fresh_db(&db_path).unwrap();
+        let mut cache = FkCache::init(&conn).unwrap();
+        let client = JellyfinClient::new(&Config::default()).unwrap();
+        let video = |height: i32| MediaStream {
+            stream_type: "Video".into(),
+            height: Some(height),
+            codec: Some("hevc".into()),
+            ..Default::default()
+        };
+        let source = |id: &str, height: i32, name: &str| MediaSource {
+            id: id.into(),
+            name: Some(name.into()),
+            bitrate: Some(i64::from(height)),
+            media_streams: Some(vec![video(height)]),
+            ..Default::default()
+        };
+        let item = JellyfinItem {
+            id: "movie".into(),
+            name: "GOAT".into(),
+            item_type: "Movie".into(),
+            media_sources: Some(vec![source("hd", 1080, "GOAT.1080p.mkv"), source("uhd", 2160, "GOAT.2160p.mkv")]),
+            ..Default::default()
+        };
+        bulk_insert_items(&mut conn, &mut cache, &client, &[item], 0).unwrap();
+        let versions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM videoversion", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(versions, 2);
+        let has: i64 = conn
+            .query_row("SELECT hasVideoVersions FROM movie_view LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(has, 1);
+        let default_file: String = conn
+            .query_row(
+                "SELECT f.strFilename FROM movie m JOIN files f ON f.idFile = m.idFile",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(default_file.contains("source=uhd"), "{default_file}");
+        let files: Vec<String> = conn
+            .prepare("SELECT strFilename FROM files")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(files.iter().any(|f| f.contains("source=hd")));
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM videoversiontype WHERE id != ?1")
+            .unwrap()
+            .query_map(params![VIDEO_VERSION_ID_DEFAULT], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(names.iter().any(|n| n.contains("2160p")));
+        assert!(names.iter().any(|n| n.contains("1080p")));
+    }
+
+    #[test]
+    fn delete_mapped_removes_movie_and_all_alternate_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("test_delete_versions.db");
+        let map_path = temp.path().join("test_map.db");
+        let mut conn = open_fresh_db(&db_path).unwrap();
+        let mut cache = FkCache::init(&conn).unwrap();
+        let cfg = Config::default();
+        let client = JellyfinClient::new(&cfg).unwrap();
+
+        let video = |height: i32| MediaStream {
+            stream_type: "Video".into(),
+            height: Some(height),
+            codec: Some("hevc".into()),
+            ..Default::default()
+        };
+        let source = |id: &str, height: i32, name: &str| MediaSource {
+            id: id.into(),
+            name: Some(name.into()),
+            bitrate: Some(i64::from(height)),
+            media_streams: Some(vec![video(height)]),
+            ..Default::default()
+        };
+        let item = JellyfinItem {
+            id: "m_del".into(),
+            name: "Delete Me".into(),
+            item_type: "Movie".into(),
+            media_sources: Some(vec![source("hd", 1080, "Delete.1080p.mkv"), source("uhd", 2160, "Delete.2160p.mkv")]),
+            ..Default::default()
+        };
+        bulk_insert_items(&mut conn, &mut cache, &client, &[item], 0).unwrap();
+        MapDb::rebuild_from_pass(&map_path, 1, &cache.take_map()).unwrap();
+        drop(conn);
+
+        delete_mapped(&db_path, &map_path, "m_del").unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let movie_count: i64 = conn.query_row("SELECT COUNT(*) FROM movie", [], |r| r.get(0)).unwrap();
+        assert_eq!(movie_count, 0);
+        let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(file_count, 0);
+        let vv_count: i64 = conn.query_row("SELECT COUNT(*) FROM videoversion", [], |r| r.get(0)).unwrap();
+        assert_eq!(vv_count, 0);
+    }
+
+    #[test]
     fn series_merging_across_libraries_preserves_all_seasons_and_episodes() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("test_series_merge.db");
@@ -1641,6 +1858,7 @@ mod tests {
             index_number: None,
             provider_ids: None,
             media_sources: None,
+            media_source_count: None,
             media_streams: None,
             primary_version_id: None,
             ..Default::default()
@@ -1670,6 +1888,7 @@ mod tests {
             index_number: Some(1),
             provider_ids: None,
             media_sources: None,
+            media_source_count: None,
             media_streams: None,
             primary_version_id: None,
             ..Default::default()
@@ -1699,6 +1918,7 @@ mod tests {
             index_number: Some(4),
             provider_ids: None,
             media_sources: None,
+            media_source_count: None,
             media_streams: None,
             primary_version_id: None,
             ..Default::default()
@@ -1728,6 +1948,7 @@ mod tests {
             index_number: Some(1),
             provider_ids: None,
             media_sources: None,
+            media_source_count: None,
             media_streams: None,
             primary_version_id: None,
             ..Default::default()
